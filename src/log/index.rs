@@ -23,10 +23,16 @@ pub const ENTIRE_WIDTH: u64 = OFF_WIDTH + POSITION_WIDTH;
 impl Index {
     pub fn new(file: File, config: Config) -> io::Result<Self> {
         let mut size = file.metadata()?.len();
+        let is_new = size == 0;
         file.set_len(config.max_index_bytes);
-        let mmap = unsafe { MmapMut::map_mut(&file) }.unwrap();
 
-        if size == config.max_index_bytes {
+        let mut mmap = unsafe { MmapMut::map_mut(&file) }.unwrap();
+
+        if is_new {
+            // Mark every slot as unwritten so recover_size can tell a real
+            // entry (off == 0 is valid for the first one) apart from padding.
+            mmap.fill(0xFF);
+        } else if size == config.max_index_bytes {
             size = Self::recover_size(&mmap)
         }
 
@@ -174,8 +180,150 @@ mod test {
         fs::remove_file(&file_name).unwrap();
     }
 
+    #[test]
+    fn index_close_truncates_file_on_clean_shutdown() {
+        let (file, file_name) = temp_file(".index");
+
+        {
+            let mut index = Index::new(file, Config::stub()).unwrap();
+            index_write(&mut index);
+            index.close().unwrap();
+        }
+
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .open(&file_name)
+            .unwrap();
+
+        assert_eq!(file.metadata().unwrap().len(), 4 * ENTIRE_WIDTH);
+
+        let mut index = Index::new(file, Config::stub()).unwrap();
+        assert_eq!(index.size, 4 * ENTIRE_WIDTH);
+        index_read(&mut index);
+
+        fs::remove_file(&file_name).unwrap();
+    }
+
+    #[test]
+    fn index_name_returns_file_path() {
+        let (file, file_name) = temp_file(".index");
+        let index = Index::new(file, Config::stub()).unwrap();
+
+        let name = index.name().unwrap();
+        assert_eq!(name, file_name.canonicalize().unwrap());
+
+        fs::remove_file(&file_name).unwrap();
+    }
+
+    #[test]
+    fn index_write_errors_when_full() {
+        let (file, file_name) = temp_file(".index");
+        let config = Config {
+            max_index_bytes: 2 * ENTIRE_WIDTH,
+            ..Config::stub()
+        };
+
+        let mut index = Index::new(file, config).unwrap();
+        index.write(0, payload(0)).unwrap();
+        index.write(1, payload(1)).unwrap();
+
+        let err = index.write(2, payload(2)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+
+        fs::remove_file(&file_name).unwrap();
+    }
+
+    #[test]
+    fn index_read_errors_when_out_of_range() {
+        let (file, file_name) = temp_file(".index");
+        let mut index = Index::new(file, Config::stub()).unwrap();
+
+        index.write(0, payload(0)).unwrap();
+
+        let err = index.read(5).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+
+        fs::remove_file(&file_name).unwrap();
+    }
+
+    #[test]
+    fn index_recovers_zero_size_when_nothing_written() {
+        let (file, file_name) = temp_file(".index");
+
+        {
+            let _index = Index::new(file, Config::stub()).unwrap();
+        }
+
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .open(&file_name)
+            .unwrap();
+
+        let index = Index::new(file, Config::stub()).unwrap();
+        assert_eq!(index.size, 0);
+
+        fs::remove_file(&file_name).unwrap();
+    }
+
+    #[test]
+    fn index_recovers_full_size_when_completely_packed() {
+        let (file, file_name) = temp_file(".index");
+        let config = Config {
+            max_index_bytes: 4 * ENTIRE_WIDTH,
+            ..Config::stub()
+        };
+
+        {
+            let mut index = Index::new(file, config.clone()).unwrap();
+            index_write(&mut index);
+        }
+
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .open(&file_name)
+            .unwrap();
+
+        let mut index = Index::new(file, config).unwrap();
+        assert_eq!(index.size, 4 * ENTIRE_WIDTH);
+        index_read(&mut index);
+
+        fs::remove_file(&file_name).unwrap();
+    }
+
+    #[test]
+    fn index_write_after_recovery_appends_correctly() {
+        let (file, file_name) = temp_file(".index");
+
+        {
+            let mut index = Index::new(file, Config::stub()).unwrap();
+            index_write(&mut index);
+        }
+
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .open(&file_name)
+            .unwrap();
+
+        let mut index = Index::new(file, Config::stub()).unwrap();
+        assert_eq!(index.size, 4 * ENTIRE_WIDTH);
+
+        index.write(4, payload(4)).unwrap();
+
+        let (off, pos) = index.read(4).unwrap();
+        assert_eq!(off, 4);
+        assert_eq!(pos, payload(4));
+
+        index_read(&mut index);
+
+        fs::remove_file(&file_name).unwrap();
+    }
+
     fn payload(i: u64) -> u64 {
-        return 1_000_000 + 1;
+        1_000_000 + i
     }
 
     fn index_write(index: &mut Index) {
