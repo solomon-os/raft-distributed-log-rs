@@ -8,12 +8,15 @@ use std::{
     path::PathBuf,
 };
 
-use crate::log::Config;
+#[derive(Clone)]
+pub struct Config {
+    pub max_size_bytes: u64,
+}
 
 pub struct Index {
     file: File,
     mmap: MmapMut,
-    size: u64,
+    pub size: u64,
 }
 
 const OFF_WIDTH: u64 = 4;
@@ -24,7 +27,8 @@ impl Index {
     pub fn new(file: File, config: Config) -> io::Result<Self> {
         let mut size = file.metadata()?.len();
         let is_new = size == 0;
-        file.set_len(config.max_index_bytes);
+
+        file.set_len(config.max_size_bytes);
 
         let mut mmap = unsafe { MmapMut::map_mut(&file) }.unwrap();
 
@@ -32,7 +36,7 @@ impl Index {
             // Mark every slot as unwritten so recover_size can tell a real
             // entry (off == 0 is valid for the first one) apart from padding.
             mmap.fill(0xFF);
-        } else if size == config.max_index_bytes {
+        } else if size == config.max_size_bytes {
             size = Self::recover_size(&mmap)
         }
 
@@ -75,7 +79,7 @@ impl Index {
         }
 
         let name = std::ffi::CStr::from_bytes_until_nul(&buf)
-            .unwrap()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
             .to_string_lossy()
             .into_owned();
         Ok(PathBuf::from(name))
@@ -83,9 +87,6 @@ impl Index {
 
     pub fn write(&mut self, offset: u32, pos: u64) -> io::Result<()> {
         if self.size + ENTIRE_WIDTH > self.mmap.len() as u64 {
-            println!("{}", self.size + ENTIRE_WIDTH);
-            println!("{}", self.mmap.len());
-
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "index is full",
@@ -123,9 +124,13 @@ impl Index {
         Ok((u32::from_be_bytes(off_bytes), u64::from_be_bytes(pos_bytes)))
     }
 
+    pub fn len(&self) -> u64 {
+        self.size
+    }
+
     pub fn close(&mut self) -> Result<()> {
         self.mmap.flush()?;
-        self.file.sync_all();
+        self.file.sync_all()?;
         self.file.set_len(self.size)?;
 
         Ok(())
@@ -144,9 +149,13 @@ mod test {
     fn index_lifecycle() {
         let (file, file_name) = temp_file(".index");
 
-        let config = Config::stub();
-
-        let mut index = Index::new(file, config).unwrap();
+        let mut index = Index::new(
+            file,
+            Config {
+                max_size_bytes: ENTIRE_WIDTH * 8,
+            },
+        )
+        .unwrap();
         index_write(&mut index);
         index_read(&mut index);
 
@@ -156,8 +165,10 @@ mod test {
     #[test]
     fn index_recovers_size_after_abrupt_drop() {
         let (file, file_name) = temp_file(".index");
+        let config = Config {
+            max_size_bytes: ENTIRE_WIDTH * 8,
+        };
 
-        let config = Config::stub();
         {
             let config = config.clone();
             let mut index = Index::new(file, config).unwrap();
@@ -170,9 +181,15 @@ mod test {
             .open(&file_name)
             .unwrap();
 
-        assert_eq!(config.max_index_bytes, file.metadata().unwrap().len());
+        assert_eq!(config.max_size_bytes, file.metadata().unwrap().len());
 
-        let mut index = Index::new(file, Config::stub()).unwrap();
+        let mut index = Index::new(
+            file,
+            Config {
+                max_size_bytes: ENTIRE_WIDTH * 8,
+            },
+        )
+        .unwrap();
 
         assert_eq!(index.size, 4 * ENTIRE_WIDTH);
         index_read(&mut index);
@@ -185,7 +202,13 @@ mod test {
         let (file, file_name) = temp_file(".index");
 
         {
-            let mut index = Index::new(file, Config::stub()).unwrap();
+            let mut index = Index::new(
+                file,
+                Config {
+                    max_size_bytes: ENTIRE_WIDTH * 8,
+                },
+            )
+            .unwrap();
             index_write(&mut index);
             index.close().unwrap();
         }
@@ -198,7 +221,13 @@ mod test {
 
         assert_eq!(file.metadata().unwrap().len(), 4 * ENTIRE_WIDTH);
 
-        let mut index = Index::new(file, Config::stub()).unwrap();
+        let mut index = Index::new(
+            file,
+            Config {
+                max_size_bytes: ENTIRE_WIDTH * 8,
+            },
+        )
+        .unwrap();
         assert_eq!(index.size, 4 * ENTIRE_WIDTH);
         index_read(&mut index);
 
@@ -208,7 +237,13 @@ mod test {
     #[test]
     fn index_name_returns_file_path() {
         let (file, file_name) = temp_file(".index");
-        let index = Index::new(file, Config::stub()).unwrap();
+        let index = Index::new(
+            file,
+            Config {
+                max_size_bytes: ENTIRE_WIDTH * 8,
+            },
+        )
+        .unwrap();
 
         let name = index.name().unwrap();
         assert_eq!(name, file_name.canonicalize().unwrap());
@@ -220,8 +255,7 @@ mod test {
     fn index_write_errors_when_full() {
         let (file, file_name) = temp_file(".index");
         let config = Config {
-            max_index_bytes: 2 * ENTIRE_WIDTH,
-            ..Config::stub()
+            max_size_bytes: 2 * ENTIRE_WIDTH,
         };
 
         let mut index = Index::new(file, config).unwrap();
@@ -237,7 +271,13 @@ mod test {
     #[test]
     fn index_read_errors_when_out_of_range() {
         let (file, file_name) = temp_file(".index");
-        let mut index = Index::new(file, Config::stub()).unwrap();
+        let mut index = Index::new(
+            file,
+            Config {
+                max_size_bytes: ENTIRE_WIDTH * 8,
+            },
+        )
+        .unwrap();
 
         index.write(0, payload(0)).unwrap();
 
@@ -252,7 +292,13 @@ mod test {
         let (file, file_name) = temp_file(".index");
 
         {
-            let _index = Index::new(file, Config::stub()).unwrap();
+            let _index = Index::new(
+                file,
+                Config {
+                    max_size_bytes: ENTIRE_WIDTH * 8,
+                },
+            )
+            .unwrap();
         }
 
         let file = File::options()
@@ -261,7 +307,13 @@ mod test {
             .open(&file_name)
             .unwrap();
 
-        let index = Index::new(file, Config::stub()).unwrap();
+        let index = Index::new(
+            file,
+            Config {
+                max_size_bytes: ENTIRE_WIDTH * 8,
+            },
+        )
+        .unwrap();
         assert_eq!(index.size, 0);
 
         fs::remove_file(&file_name).unwrap();
@@ -271,8 +323,10 @@ mod test {
     fn index_recovers_full_size_when_completely_packed() {
         let (file, file_name) = temp_file(".index");
         let config = Config {
-            max_index_bytes: 4 * ENTIRE_WIDTH,
-            ..Config::stub()
+            max_size_bytes: 4 * ENTIRE_WIDTH,
+            ..Config {
+                max_size_bytes: ENTIRE_WIDTH * 8,
+            }
         };
 
         {
@@ -298,7 +352,13 @@ mod test {
         let (file, file_name) = temp_file(".index");
 
         {
-            let mut index = Index::new(file, Config::stub()).unwrap();
+            let mut index = Index::new(
+                file,
+                Config {
+                    max_size_bytes: ENTIRE_WIDTH * 8,
+                },
+            )
+            .unwrap();
             index_write(&mut index);
         }
 
@@ -308,7 +368,13 @@ mod test {
             .open(&file_name)
             .unwrap();
 
-        let mut index = Index::new(file, Config::stub()).unwrap();
+        let mut index = Index::new(
+            file,
+            Config {
+                max_size_bytes: ENTIRE_WIDTH * 8,
+            },
+        )
+        .unwrap();
         assert_eq!(index.size, 4 * ENTIRE_WIDTH);
 
         index.write(4, payload(4)).unwrap();

@@ -4,9 +4,15 @@ use std::{
     os::unix::fs::FileExt,
 };
 
-use crate::log::Config;
+#[cfg(target_os = "macos")]
+use std::os::fd::AsRawFd;
 
-struct Store {
+#[derive(Clone)]
+pub struct Config {
+    pub sync_writes: bool,
+}
+
+pub struct Store {
     size: u64,
     file: File,
     writer: BufWriter<File>,
@@ -41,23 +47,41 @@ impl Store {
         Ok(written as u64)
     }
 
-    fn read(&mut self, pos: u64) -> io::Result<&[u8]> {
-        let mut size = [0; LENGTH_WIDTH];
-        self.writer.flush()?;
-        self.file.read_exact_at(&mut size, pos)?;
-        self.read_buf.resize(u64::from_be_bytes(size) as usize, 0);
-        self.file
-            .read_exact_at(&mut self.read_buf, pos + LENGTH_WIDTH as u64)?;
-        Ok(&self.read_buf)
+    #[cfg(target_os = "linux")]
+    pub fn name(&self) -> io::Result<PathBuf> {
+        fs::read_link(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
     }
 
-    pub fn read_into_buffer(&mut self, pos: u64, buf: &mut Vec<u8>) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    pub fn name(&self) -> io::Result<String> {
+        let mut buf = [0u8; libc::PATH_MAX as usize];
+        let ret = unsafe {
+            libc::fcntl(
+                self.file.as_raw_fd(),
+                libc::F_GETPATH,
+                buf.as_mut_ptr() as *mut libc::c_char,
+            )
+        };
+        if ret == -1 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let name = std::ffi::CStr::from_bytes_until_nul(&buf)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        Ok(name.to_string_lossy().into_owned())
+    }
+
+    pub fn read(&mut self, pos: u64, buf: &mut Vec<u8>) -> io::Result<()> {
         let mut size = [0; LENGTH_WIDTH];
         self.writer.flush()?;
         self.file.read_exact_at(&mut size, pos)?;
         buf.resize(u64::from_be_bytes(size) as usize, 0);
         self.file.read_exact_at(buf, pos + (LENGTH_WIDTH as u64))?;
         Ok(())
+    }
+
+    pub fn len(&self) -> u64 {
+        self.size
     }
 
     pub fn close(&mut self) -> io::Result<()> {
@@ -70,17 +94,17 @@ impl Store {
 #[cfg(test)]
 mod test {
     use super::*;
-    use std::{env::temp_dir, fs};
+    use std::fs;
 
     #[test]
     fn store_lifecycle_no_sync_writes() {
-        let config = Config{sync_writes: false, ..Config::stub()};
+        let config = Config { sync_writes: false };
         store_lifecycle(config);
     }
 
     #[test]
     fn store_lifecycle_sync_writes() {
-        let config = Config{sync_writes: true, ..Config::stub()};
+        let config = Config { sync_writes: true };
         store_lifecycle(config);
     }
 
@@ -91,7 +115,6 @@ mod test {
 
         store_append(&mut store);
         store_read(&mut store);
-        store_read_into(&mut store);
         store_close(&mut store);
 
         fs::remove_file(&file_name).unwrap();
@@ -100,7 +123,7 @@ mod test {
     #[test]
     fn store_new_reopens_existing_file_with_correct_size() {
         let (file, file_name) = crate::log::test_util::temp_file(".store");
-        let config = Config::stub();
+        let config = Config { sync_writes: false };
 
         {
             let mut store = Store::new(file, config.clone()).unwrap();
@@ -128,25 +151,12 @@ mod test {
     #[test]
     fn store_read_errors_when_out_of_range() {
         let (file, file_name) = crate::log::test_util::temp_file(".store");
-        let mut store = Store::new(file, Config::stub()).unwrap();
-
-        store.append(&payload(0)).unwrap();
-
-        let err = store.read(1000).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
-
-        fs::remove_file(&file_name).unwrap();
-    }
-
-    #[test]
-    fn store_read_into_buffer_errors_when_out_of_range() {
-        let (file, file_name) = crate::log::test_util::temp_file(".store");
-        let mut store = Store::new(file, Config::stub()).unwrap();
+        let mut store = Store::new(file, Config { sync_writes: false }).unwrap();
 
         store.append(&payload(0)).unwrap();
 
         let mut buf = Vec::new();
-        let err = store.read_into_buffer(1000, &mut buf).unwrap_err();
+        let err = store.read(1000, &mut buf).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
 
         fs::remove_file(&file_name).unwrap();
@@ -155,31 +165,29 @@ mod test {
     #[test]
     fn store_append_empty_buffer_round_trips() {
         let (file, file_name) = crate::log::test_util::temp_file(".store");
-        let mut store = Store::new(file, Config::stub()).unwrap();
+        let mut store = Store::new(file, Config { sync_writes: false }).unwrap();
 
         let written = store.append(&[]).unwrap();
         assert_eq!(written, LENGTH_WIDTH as u64);
 
-        let buf = store.read(0).unwrap();
+        let mut buf = Vec::new();
+        store.read(0, &mut buf).unwrap();
         assert!(buf.is_empty());
 
         fs::remove_file(&file_name).unwrap();
     }
 
     #[test]
-    fn store_read_into_buffer_without_prior_flush() {
+    fn store_read_without_prior_flush() {
         let (file, file_name) = crate::log::test_util::temp_file(".store");
-        let config = Config {
-            sync_writes: false,
-            ..Config::stub()
-        };
+        let config = Config { sync_writes: false };
         let mut store = Store::new(file, config).unwrap();
 
         let write = payload(0);
         store.append(&write).unwrap();
 
         let mut buf = Vec::new();
-        store.read_into_buffer(0, &mut buf).unwrap();
+        store.read(0, &mut buf).unwrap();
         assert_eq!(&write[..], &buf[..]);
 
         fs::remove_file(&file_name).unwrap();
@@ -203,21 +211,11 @@ mod test {
 
     fn store_read(store: &mut Store) {
         let mut pos = 0;
-        for i in 0..4 {
-            let write = payload(i);
-            let buf = store.read(pos).unwrap();
-            assert_eq!(buf, &write[..]);
-            pos += (write.len() + LENGTH_WIDTH) as u64;
-        }
-    }
-
-    fn store_read_into(store: &mut Store) {
-        let mut pos = 0;
         let mut buf = Vec::new();
 
         for i in 0..4 {
             let write = payload(i);
-            store.read_into_buffer(pos, &mut buf).unwrap();
+            store.read(pos, &mut buf).unwrap();
             assert_eq!(&write[..], &buf[..]);
             pos += (write.len() + LENGTH_WIDTH) as u64;
         }
