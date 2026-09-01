@@ -1,18 +1,18 @@
 use std::{
     fs::{self, File},
-    io::{self, Result},
+    io::{self},
     path::PathBuf,
 };
 
 use crate::log::{index, store};
 
-struct Config {
-    max_index_bytes: u64,
-    max_store_bytes: u64,
-    sync_writes: bool,
+pub(crate) struct Config {
+    pub(crate) max_index_bytes: u64,
+    pub(crate) max_store_bytes: u64,
+    pub(crate) sync_writes: bool,
 }
 
-struct Segment {
+pub struct Segment {
     cfg: Config,
     index: index::Index,
     store: store::Store,
@@ -82,9 +82,27 @@ impl Segment {
         self.index.len() >= self.cfg.max_index_bytes || self.store.len() >= self.cfg.max_store_bytes
     }
 
-    pub fn remove(&mut self) -> io::Result<()> {
+    pub fn is_in_range(&self, off: u64) -> bool {
+        self.base_offset <= off && self.next_offset > off
+    }
+
+    pub fn is_greater_than_range(&self, off: u64) -> bool {
+        off >= self.next_offset
+    }
+
+    pub fn is_lesser_than_range(&self, off: u64) -> bool {
+        off < self.base_offset
+    }
+
+    pub fn close(&mut self) -> io::Result<()> {
         self.store.close()?;
         self.index.close()?;
+
+        Ok(())
+    }
+
+    pub fn remove(&mut self) -> io::Result<()> {
+        self.close()?;
         fs::remove_file(self.store.name()?)?;
         fs::remove_file(self.index.name()?)?;
 

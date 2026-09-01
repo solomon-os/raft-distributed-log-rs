@@ -102,7 +102,7 @@ impl Index {
         Ok(())
     }
 
-    pub fn read(&mut self, off: u32) -> io::Result<(u32, u64)> {
+    pub fn read(&self, off: u32) -> io::Result<(u32, u64)> {
         let start = off as usize * ENTIRE_WIDTH as usize;
         if start as u64 + ENTIRE_WIDTH > self.size {
             return Err(io::Error::new(
