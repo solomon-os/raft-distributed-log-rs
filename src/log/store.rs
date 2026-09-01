@@ -1,12 +1,10 @@
-use std::os::unix::fs::FileExt;
 use std::{
     fs::File,
     io::{self, BufWriter, Write},
+    os::unix::fs::FileExt,
 };
 
-pub struct Config {
-    pub sync_writes: bool,
-}
+use crate::log::Config;
 
 struct Store {
     size: u64,
@@ -45,6 +43,7 @@ impl Store {
 
     fn read(&mut self, pos: u64) -> io::Result<&[u8]> {
         let mut size = [0; LENGTH_WIDTH];
+        self.writer.flush()?;
         self.file.read_exact_at(&mut size, pos)?;
         self.read_buf.resize(u64::from_be_bytes(size) as usize, 0);
         self.file
@@ -73,7 +72,18 @@ mod test {
     use std::{env::temp_dir, fs};
 
     #[test]
-    fn test_store_lifecycle() {
+    fn store_lifecycle_no_sync_writes() {
+        let config = Config{sync_writes: false, ..Config::stub()};
+        store_lifecycle(config);
+    }
+
+    #[test]
+    fn store_lifecycle_sync_writes() {
+        let config = Config{sync_writes: true, ..Config::stub()};
+        store_lifecycle(config);
+    }
+
+    fn store_lifecycle(config: Config) {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -89,13 +99,12 @@ mod test {
             Err(error) => panic!("{error}"),
         };
 
-        let config = Config { sync_writes: true };
         let mut store = Store::new(file, config).unwrap();
 
-        test_append(&mut store);
-        test_read(&mut store);
-        test_read_into(&mut store);
-        test_close(&mut store);
+        store_append(&mut store);
+        store_read(&mut store);
+        store_read_into(&mut store);
+        store_close(&mut store);
 
         fs::remove_file(&file_name).unwrap();
     }
@@ -104,7 +113,7 @@ mod test {
         format!("hello world {i}").into_bytes()
     }
 
-    fn test_append(store: &mut Store) {
+    fn store_append(store: &mut Store) {
         let mut pos = store.size;
         for i in 0..4 {
             let write = payload(i);
@@ -116,7 +125,7 @@ mod test {
         }
     }
 
-    fn test_read(store: &mut Store) {
+    fn store_read(store: &mut Store) {
         let mut pos = 0;
         for i in 0..4 {
             let write = payload(i);
@@ -126,7 +135,7 @@ mod test {
         }
     }
 
-    fn test_read_into(store: &mut Store) {
+    fn store_read_into(store: &mut Store) {
         let mut pos = 0;
         let mut buf = Vec::new();
 
@@ -138,7 +147,7 @@ mod test {
         }
     }
 
-    fn test_close(store: &mut Store) {
+    fn store_close(store: &mut Store) {
         store.close().unwrap();
     }
 }
