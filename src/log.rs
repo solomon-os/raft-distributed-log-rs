@@ -1,4 +1,4 @@
-use std::{fs, io, path::PathBuf};
+use std::{fs, io, path::PathBuf, thread, time::Duration};
 
 use crate::log::segment::Segment;
 
@@ -132,10 +132,198 @@ impl Log {
                     segment.remove()?;
                     self.active_index = self.active_index.saturating_sub(1);
                 } else {
+                    println!("break called");
                     break;
                 }
+            } else {
+                break;
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::log::test_util::{create_segment_files, temp_dir_with_prefix};
+    use pretty_assertions::assert_eq;
+
+    fn temp_dir() -> PathBuf {
+        temp_dir_with_prefix("log-test")
+    }
+
+    fn config(max_index_bytes: u64, max_store_bytes: u64) -> Config {
+        Config {
+            inital_offset: 0,
+            sync_writes: false,
+            max_size_bytes: max_index_bytes,
+            max_store_bytes,
+        }
+    }
+
+    #[test]
+    fn new_creates_initial_segment_in_empty_dir() {
+        let dir = temp_dir();
+        let log = Log::new(config(1024, 1024), dir.clone()).unwrap();
+
+        assert_eq!(log.segments.len(), 1);
+        assert_eq!(log.active_index, 0);
+        assert!(dir.join("0.store").exists());
+        assert!(dir.join("0.index").exists());
+    }
+
+    #[test]
+    fn new_loads_existing_segments() {
+        let dir = temp_dir();
+        create_segment_files(&dir, 0);
+        create_segment_files(&dir, 16);
+        create_segment_files(&dir, 32);
+
+        let log = Log::new(config(1024, 1024), dir).unwrap();
+
+        assert_eq!(log.segments.len(), 3);
+        assert_eq!(log.active_index, 2);
+        assert_eq!(log.segments[0].base_offset(), 0);
+        assert_eq!(log.segments[1].base_offset(), 16);
+        assert_eq!(log.segments[2].base_offset(), 32);
+    }
+
+    #[test]
+    fn append_and_read_single_record() {
+        let dir = temp_dir();
+        let mut log = Log::new(config(1024, 1024), dir).unwrap();
+
+        let off = log.append(b"hello").unwrap();
+        assert_eq!(off, 0);
+
+        let mut buf = Vec::new();
+        log.read(off, &mut buf).unwrap();
+        assert_eq!(buf, b"hello");
+    }
+
+    #[test]
+    fn append_returns_incrementing_offsets() {
+        let dir = temp_dir();
+        let mut log = Log::new(config(1024, 1024), dir).unwrap();
+
+        assert_eq!(log.append(b"a").unwrap(), 0);
+        assert_eq!(log.append(b"b").unwrap(), 1);
+        assert_eq!(log.append(b"c").unwrap(), 2);
+    }
+
+    #[test]
+    fn append_rotates_to_new_segment_when_maxed() {
+        let dir = temp_dir();
+        // Each segment can hold exactly one index entry.
+        let mut log = Log::new(config(index::ENTIRE_WIDTH, 1024), dir.clone()).unwrap();
+
+        let off0 = log.append(b"first").unwrap();
+        assert_eq!(off0, 0);
+        // Segment 0 is now maxed, so a new empty segment 1 is created eagerly.
+        assert_eq!(log.segments.len(), 2);
+        assert_eq!(log.active_index, 1);
+
+        let off1 = log.append(b"second").unwrap();
+        assert_eq!(off1, 1);
+        // Segment 1 is now maxed, so a new empty segment 2 is created eagerly.
+        assert_eq!(log.segments.len(), 3);
+        assert_eq!(log.active_index, 2);
+
+        // New segment file should have been created.
+        assert!(dir.join("2.store").exists());
+        assert!(dir.join("2.index").exists());
+    }
+
+    #[test]
+    fn read_across_segments() {
+        let dir = temp_dir();
+        let mut log = Log::new(config(index::ENTIRE_WIDTH, 1024), dir).unwrap();
+
+        let mut offsets = Vec::new();
+        for i in 0..4 {
+            offsets.push(log.append(format!("record-{i}").as_bytes()).unwrap());
+        }
+
+        for (i, off) in offsets.iter().enumerate() {
+            let mut buf = Vec::new();
+            log.read(*off, &mut buf).unwrap();
+            assert_eq!(buf, format!("record-{i}").into_bytes());
+        }
+    }
+
+    #[test]
+    fn read_out_of_range_errors() {
+        let dir = temp_dir();
+        let mut log = Log::new(config(1024, 1024), dir).unwrap();
+
+        log.append(b"only one").unwrap();
+
+        assert!(log.read(1, &mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn close_closes_all_segments() {
+        let dir = temp_dir();
+        let mut log = Log::new(config(index::ENTIRE_WIDTH, 1024), dir).unwrap();
+
+        log.append(b"one").unwrap();
+        log.append(b"two").unwrap();
+
+        log.close().unwrap();
+    }
+
+    #[test]
+    fn truncate_removes_trailing_segments() {
+        let dir = temp_dir();
+        let mut log = Log::new(config(index::ENTIRE_WIDTH, 1024), dir.clone()).unwrap();
+
+        let off0 = log.append(b"zero").unwrap();
+        let _off1 = log.append(b"one").unwrap();
+        let _off2 = log.append(b"two").unwrap();
+
+        // Eager rotation creates an extra empty segment after each maxed append.
+        assert_eq!(log.segments.len(), 4);
+        assert_eq!(log.active_index, 3);
+
+        // Truncate at the boundary between segment 0 and segment 1.
+        log.truncate(off0 + 1).unwrap();
+
+        // Segments with base_offset > 1 should be removed.
+        assert_eq!(log.segments.len(), 2);
+        assert_eq!(log.active_index, 1);
+        assert!(!dir.join("2.store").exists());
+        assert!(!dir.join("2.index").exists());
+        assert!(!dir.join("3.store").exists());
+        assert!(!dir.join("3.index").exists());
+    }
+
+    #[test]
+    fn reopen_loads_all_segments() {
+        let dir = temp_dir();
+        let mut offsets = Vec::new();
+
+        {
+            let mut log = Log::new(config(index::ENTIRE_WIDTH, 1024), dir.clone()).unwrap();
+            for i in 0..3 {
+                offsets.push(log.append(format!("rec-{i}").as_bytes()).unwrap());
+            }
+            log.close().unwrap();
+        }
+
+        {
+            let mut log = Log::new(config(index::ENTIRE_WIDTH, 1024), dir).unwrap();
+            // Eager rotation left an empty trailing segment, so 4 files/segments.
+            assert_eq!(log.segments.len(), 4);
+
+            for (i, off) in offsets.iter().enumerate() {
+                let mut buf = Vec::new();
+                log.read(*off, &mut buf)
+                    .expect(&format!("failed to read offset {} (record rec-{})", off, i));
+                assert_eq!(buf, format!("rec-{i}").into_bytes());
+            }
+        }
     }
 }

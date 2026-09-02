@@ -7,16 +7,16 @@ use std::{
 #[cfg(target_os = "macos")]
 use std::os::fd::AsRawFd;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Config {
     pub sync_writes: bool,
 }
 
+#[derive(Debug)]
 pub struct Store {
     size: u64,
     file: File,
     writer: BufWriter<File>,
-    read_buf: Vec<u8>,
     config: Config,
 }
 
@@ -31,7 +31,6 @@ impl Store {
             size,
             writer,
             file,
-            read_buf: Vec::new(),
         })
     }
 

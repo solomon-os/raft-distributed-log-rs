@@ -8,3 +8,6 @@ memmap2 = "0.9.11"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+pretty_assertions = "1.4.1"

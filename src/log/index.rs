@@ -8,11 +8,12 @@ use std::{
     path::PathBuf,
 };
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Config {
     pub max_size_bytes: u64,
 }
 
+#[derive(Debug)]
 pub struct Index {
     file: File,
     mmap: MmapMut,
@@ -28,7 +29,7 @@ impl Index {
         let mut size = file.metadata()?.len();
         let is_new = size == 0;
 
-        file.set_len(config.max_size_bytes);
+        file.set_len(config.max_size_bytes)?;
 
         let mut mmap = unsafe { MmapMut::map_mut(&file) }.unwrap();
 
@@ -114,7 +115,6 @@ impl Index {
         let off_bytes: [u8; OFF_WIDTH as usize] = self.mmap[start..start + OFF_WIDTH as usize]
             .try_into()
             .unwrap();
-        let off = u32::from_be_bytes(off_bytes);
         let pos_start = start + OFF_WIDTH as usize;
         let pos_bytes: [u8; POSITION_WIDTH as usize] = self.mmap
             [pos_start..pos_start + POSITION_WIDTH as usize]
@@ -128,10 +128,14 @@ impl Index {
         self.size
     }
 
+    pub fn current_offset(&self) -> u64 {
+        self.size / ENTIRE_WIDTH
+    }
+
     pub fn close(&mut self) -> Result<()> {
         self.mmap.flush()?;
-        self.file.sync_all()?;
         self.file.set_len(self.size)?;
+        self.file.sync_all()?;
 
         Ok(())
     }
@@ -139,7 +143,7 @@ impl Index {
 
 #[cfg(test)]
 mod test {
-    use std::{env::temp_dir, fs};
+    use std::fs;
 
     use crate::log::test_util::temp_file;
 

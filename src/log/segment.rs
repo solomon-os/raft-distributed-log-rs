@@ -6,12 +6,14 @@ use std::{
 
 use crate::log::{index, store};
 
-pub(crate) struct Config {
+#[derive(Debug)]
+pub struct Config {
     pub(crate) max_index_bytes: u64,
     pub(crate) max_store_bytes: u64,
     pub(crate) sync_writes: bool,
 }
 
+#[derive(Debug)]
 pub struct Segment {
     cfg: Config,
     index: index::Index,
@@ -23,12 +25,15 @@ pub struct Segment {
 impl Segment {
     pub fn new(cfg: Config, base_offset: u64, data_dir: PathBuf) -> io::Result<Self> {
         let store_file = File::options()
-            .write(true)
             .read(true)
+            .create(true)
+            .append(true)
             .open(data_dir.join(format!("{base_offset}.store")))?;
         let index_file = File::options()
             .write(true)
             .read(true)
+            .truncate(false)
+            .create(true)
             .open(data_dir.join(format!("{base_offset}.index")))?;
 
         let store = store::Store::new(
@@ -44,12 +49,17 @@ impl Segment {
             },
         )?;
 
+        let mut next_offset = base_offset;
+        if index.len() > 0 {
+            next_offset = base_offset + index.current_offset();
+        }
+
         Ok(Self {
             cfg,
             index,
             store,
             base_offset,
-            next_offset: base_offset,
+            next_offset,
         })
     }
 
@@ -94,6 +104,10 @@ impl Segment {
         off < self.base_offset
     }
 
+    pub fn base_offset(&self) -> u64 {
+        self.base_offset
+    }
+
     pub fn close(&mut self) -> io::Result<()> {
         self.store.close()?;
         self.index.close()?;
@@ -112,31 +126,13 @@ impl Segment {
 
 #[cfg(test)]
 mod test {
-    use std::{
-        fs::{self, File},
-        path::PathBuf,
-        sync::atomic::{AtomicU64, Ordering},
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::path::PathBuf;
 
     use super::*;
-
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    use crate::log::test_util::{create_segment_files, temp_dir_with_prefix};
 
     fn temp_dir() -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let count = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("segment-test-{nanos}-{count}"));
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    fn create_segment_files(dir: &PathBuf, base_offset: u64) {
-        File::create(dir.join(format!("{base_offset}.store"))).unwrap();
-        File::create(dir.join(format!("{base_offset}.index"))).unwrap();
+        temp_dir_with_prefix("segment-test")
     }
 
     fn config(max_index_bytes: u64, max_store_bytes: u64) -> Config {
