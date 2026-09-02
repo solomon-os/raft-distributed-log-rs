@@ -114,12 +114,13 @@ impl Index {
 
         let off_bytes: [u8; OFF_WIDTH as usize] = self.mmap[start..start + OFF_WIDTH as usize]
             .try_into()
-            .unwrap();
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid offset bytes"))?;
+
         let pos_start = start + OFF_WIDTH as usize;
         let pos_bytes: [u8; POSITION_WIDTH as usize] = self.mmap
             [pos_start..pos_start + POSITION_WIDTH as usize]
             .try_into()
-            .unwrap();
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid position bytes"))?;
 
         Ok((u32::from_be_bytes(off_bytes), u64::from_be_bytes(pos_bytes)))
     }
@@ -388,6 +389,47 @@ mod test {
         assert_eq!(pos, payload(4));
 
         index_read(&mut index);
+
+        fs::remove_file(&file_name).unwrap();
+    }
+
+    #[test]
+    fn index_len_reflects_bytes_written() {
+        let (file, file_name) = temp_file(".index");
+        let mut index = Index::new(
+            file,
+            Config {
+                max_size_bytes: ENTIRE_WIDTH * 8,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(index.len(), 0);
+
+        index.write(0, payload(0)).unwrap();
+        assert_eq!(index.len(), ENTIRE_WIDTH);
+
+        index.write(1, payload(1)).unwrap();
+        assert_eq!(index.len(), 2 * ENTIRE_WIDTH);
+
+        fs::remove_file(&file_name).unwrap();
+    }
+
+    #[test]
+    fn index_current_offset_reflects_entries_written() {
+        let (file, file_name) = temp_file(".index");
+        let mut index = Index::new(
+            file,
+            Config {
+                max_size_bytes: ENTIRE_WIDTH * 8,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(index.current_offset(), 0);
+
+        index_write(&mut index);
+        assert_eq!(index.current_offset(), 4);
 
         fs::remove_file(&file_name).unwrap();
     }

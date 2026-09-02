@@ -326,4 +326,120 @@ mod test {
             }
         }
     }
+
+    #[test]
+    fn new_errors_on_missing_directory() {
+        let dir = temp_dir().join("does-not-exist");
+        assert!(Log::new(config(1024, 1024), dir).is_err());
+    }
+
+    #[test]
+    fn truncate_at_offset_beyond_all_segments_is_noop() {
+        let dir = temp_dir();
+        let mut log = Log::new(config(1024, 1024), dir).unwrap();
+
+        log.append(b"zero").unwrap();
+        log.append(b"one").unwrap();
+
+        let segments_before = log.segments.len();
+        log.truncate(100).unwrap();
+
+        assert_eq!(log.segments.len(), segments_before);
+    }
+
+    #[test]
+    fn append_after_close_does_not_error() {
+        let dir = temp_dir();
+        let mut log = Log::new(config(1024, 1024), dir).unwrap();
+
+        log.append(b"one").unwrap();
+        log.close().unwrap();
+
+        // The current implementation does not reject writes to a closed
+        // log; callers are expected not to append after close().
+        let off = log.append(b"two").unwrap();
+        assert_eq!(off, 1);
+    }
+
+    #[test]
+    fn truncate_to_zero_retains_only_first_segment() {
+        let dir = temp_dir();
+        let mut log = Log::new(config(index::ENTIRE_WIDTH, 1024), dir).unwrap();
+
+        log.append(b"zero").unwrap();
+        log.append(b"one").unwrap();
+        log.append(b"two").unwrap();
+
+        // Eager rotation creates an extra empty segment after each maxed append.
+        assert_eq!(log.segments.len(), 4);
+
+        log.truncate(0).unwrap();
+
+        // Only the segment containing offset 0 should remain; active_index
+        // must not underflow while popping segments 3, 2 and 1.
+        assert_eq!(log.segments.len(), 1);
+        assert_eq!(log.active_index, 0);
+        assert_eq!(log.segments[0].base_offset(), 0);
+
+        let mut buf = Vec::new();
+        log.read(0, &mut buf).unwrap();
+        assert_eq!(buf, b"zero");
+    }
+
+    #[test]
+    fn read_on_empty_log_errors() {
+        let dir = temp_dir();
+        let mut log = Log::new(config(1024, 1024), dir).unwrap();
+
+        assert!(log.read(0, &mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn new_creates_missing_index_file_for_partial_segment() {
+        let dir = temp_dir();
+        // Only the .store file exists on disk; .index is missing.
+        fs::File::create(dir.join("5.store")).unwrap();
+
+        let log = Log::new(config(1024, 1024), dir.clone()).unwrap();
+
+        assert_eq!(log.segments.len(), 1);
+        assert_eq!(log.segments[0].base_offset(), 5);
+        assert!(dir.join("5.index").exists());
+    }
+
+    #[test]
+    fn new_ignores_unrelated_and_non_numeric_files() {
+        let dir = temp_dir();
+        fs::File::create(dir.join("notes.txt")).unwrap();
+        fs::File::create(dir.join("abc.store")).unwrap();
+        fs::create_dir(dir.join("subdir")).unwrap();
+
+        let log = Log::new(config(1024, 1024), dir).unwrap();
+
+        // None of the stray entries produce a valid offset, so a fresh
+        // initial segment at the configured initial offset is created.
+        assert_eq!(log.segments.len(), 1);
+        assert_eq!(log.segments[0].base_offset(), 0);
+    }
+
+    #[test]
+    fn append_and_read_multiple_records_within_single_segment() {
+        let dir = temp_dir();
+        let mut log = Log::new(config(1024, 1024), dir).unwrap();
+
+        for i in 0..5 {
+            log.append(format!("rec-{i}").as_bytes()).unwrap();
+        }
+
+        // All records fit comfortably under the 1024 byte limits, so no
+        // rotation should have happened.
+        assert_eq!(log.segments.len(), 1);
+        assert_eq!(log.active_index, 0);
+
+        for i in 0..5 {
+            let mut buf = Vec::new();
+            log.read(i, &mut buf).unwrap();
+            assert_eq!(buf, format!("rec-{i}").into_bytes());
+        }
+    }
 }
