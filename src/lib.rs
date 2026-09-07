@@ -1,5 +1,6 @@
 mod log;
 mod membership;
+mod raft;
 
 pub fn add(left: u64, right: u64) -> u64 {
     left + right
