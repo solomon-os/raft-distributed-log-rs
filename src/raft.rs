@@ -1,6 +1,9 @@
 // Implement the Raft core here, one step at a time.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    cmp::min,
+    collections::{HashMap, HashSet},
+};
 
 use serf::net::Node;
 
@@ -17,18 +20,8 @@ pub enum Role {
 pub enum Event {
     ElectionTimeout,
     RequestVote(VoteRequest),
-}
-
-pub struct VoteRequest {
-    term: u64,
-    candidate_id: NodeId,
-    last_log_index: u64,
-    last_log_term: u64,
-}
-
-pub struct VoteResponse {
-    term: u64,
-    vote_granted: bool,
+    HeartbeatTimeout,
+    AppendEntries(AppendEntriesRequest),
 }
 
 pub enum Effect {
@@ -40,6 +33,23 @@ pub enum Effect {
         peer: NodeId,
         response: VoteResponse,
     },
+    SendHeartbeat {
+        peers: Vec<NodeId>,
+        request: HeartbeatRequest,
+    },
+    ProcessAppendEntries {
+        peer: NodeId,
+        response: AppendEntriesResponse,
+        apply_through: u64,
+    },
+    RejectAppendEntries {
+        peer: NodeId,
+        response: AppendEntriesResponse,
+    },
+    TruncateAppendEntries {
+        peer: NodeId,
+        response: AppendEntriesResponse,
+    },
 }
 
 struct Raft {
@@ -48,6 +58,7 @@ struct Raft {
     learners: HashMap<NodeId, Progress>,
     role: Role,
     current_term: u64,
+    leader_id: Option<NodeId>,
     voted_for: Option<NodeId>,
     last_applied: u64,
     commit_index: u64,
@@ -73,12 +84,14 @@ impl Raft {
         match ev {
             Event::ElectionTimeout => self.handle_election_timeout(),
             Event::RequestVote(vote_request) => self.handle_request_vote(vote_request),
+            Event::HeartbeatTimeout => self.handle_heartbeat_timeout(),
+            Event::AppendEntries(append_request) => self.handle_append_entry(append_request),
         }
     }
 
     fn handle_election_timeout(&mut self) -> Result<Effect> {
         self.current_term += 1;
-        self.voted_for = None;
+        self.voted_for = Some(self.id.clone());
 
         let peers = self
             .voters
@@ -151,6 +164,125 @@ impl Raft {
             },
         })
     }
+
+    fn handle_heartbeat_timeout(&self) -> Result<Effect> {
+        if self.role != Role::Leader {
+            return Err(Error::NotLeader);
+        }
+        Ok(Effect::SendHeartbeat {
+            peers: self
+                .voters
+                .keys()
+                .filter(|node_id| *node_id != &self.id)
+                .cloned()
+                .collect(),
+            request: HeartbeatRequest {
+                term: self.current_term,
+                leader_id: self.id.clone(),
+                log_index: self.last_log_index,
+                log_term: self.last_log_term,
+                leader_commit_index: self.commit_index,
+            },
+        })
+    }
+
+    fn handle_append_entry(&mut self, append_request: AppendEntriesRequest) -> Result<Effect> {
+        if append_request.term < self.current_term {
+            return Ok(Effect::RejectAppendEntries {
+                peer: append_request.leader_id,
+                response: AppendEntriesResponse {
+                    last_log_index: self.last_log_index,
+                    last_log_term: self.last_log_term,
+                    success: false,
+                    term: self.current_term,
+                },
+            });
+        }
+
+        if append_request.prev_log_term == self.last_log_term
+            && append_request.prev_log_index > self.last_log_index
+        {
+            self.current_term = append_request.term;
+            self.leader_id = Some(append_request.leader_id.clone());
+            return Ok(Effect::RejectAppendEntries {
+                peer: append_request.leader_id.clone(),
+                response: AppendEntriesResponse {
+                    last_log_index: self.last_log_index,
+                    last_log_term: self.last_log_term,
+                    success: false,
+                    term: self.current_term,
+                },
+            });
+        }
+
+        if append_request.term > self.current_term {
+            self.voted_for = None;
+            if append_request.prev_log_index < self.last_log_index {
+                self.role = Role::Follower;
+                self.current_term = append_request.term;
+                self.leader_id = Some(append_request.leader_id.clone());
+                return Ok(Effect::TruncateAppendEntries {
+                    peer: append_request.leader_id,
+                    response: AppendEntriesResponse {
+                        last_log_index: append_request.prev_log_index,
+                        last_log_term: append_request.prev_log_term,
+                        success: true,
+                        term: self.current_term,
+                    },
+                });
+            }
+        }
+
+        self.current_term = append_request.term;
+        self.role = Role::Follower;
+        self.leader_id = Some(append_request.leader_id.clone());
+
+        Ok(Effect::ProcessAppendEntries {
+            peer: append_request.leader_id,
+            response: AppendEntriesResponse {
+                last_log_index: self.last_log_index,
+                last_log_term: self.last_log_term,
+                success: true,
+                term: self.current_term,
+            },
+            apply_through: min(self.last_log_index, append_request.commit_index),
+        })
+    }
+}
+
+pub struct VoteRequest {
+    term: u64,
+    candidate_id: NodeId,
+    last_log_index: u64,
+    last_log_term: u64,
+}
+
+pub struct HeartbeatRequest {
+    term: u64,
+    leader_id: NodeId,
+    log_index: u64,
+    log_term: u64,
+    leader_commit_index: u64,
+}
+
+pub struct VoteResponse {
+    term: u64,
+    vote_granted: bool,
+}
+
+pub struct AppendEntriesRequest {
+    term: u64,
+    leader_id: NodeId,
+    prev_log_index: u64,
+    prev_log_term: u64,
+    commit_index: u64,
+}
+
+pub struct AppendEntriesResponse {
+    term: u64,
+    success: bool,
+    last_log_index: u64,
+    last_log_term: u64,
 }
 
 #[cfg(test)]
@@ -192,6 +324,7 @@ mod tests {
             commit_index: 0,
             last_log_index,
             last_log_term,
+            leader_id: Some(node("old-leader")),
         }
     }
 
@@ -216,6 +349,7 @@ mod tests {
                 (peer, response.term, response.vote_granted)
             }
             Effect::SendRequestVotes { .. } => panic!("RequestVote must produce a response"),
+            _ => panic!("RequestVote must produce a vote response"),
         }
     }
 
@@ -237,6 +371,7 @@ mod tests {
             commit_index: 0,
             last_log_index: 8,
             last_log_term: 2,
+            leader_id: Some(node("old-leader")),
         };
 
         let effect = raft.handle(Event::ElectionTimeout).unwrap();
@@ -279,6 +414,7 @@ mod tests {
             commit_index: 0,
             last_log_index: 8,
             last_log_term: 2,
+            leader_id: Some(node("old-leader")),
         };
 
         let effect = raft.handle(Event::ElectionTimeout).unwrap();
@@ -359,5 +495,132 @@ mod tests {
 
         assert_eq!(newer_term_response, (node("node-2"), 4, true));
         assert_eq!(same_position_response, (node("node-2"), 4, true));
+    }
+
+    #[test]
+    fn append_entries_rejects_an_older_leader_term() {
+        let mut raft = follower(4, None, 8, 3);
+
+        let effect = raft
+            .handle(Event::AppendEntries(AppendEntriesRequest {
+                term: 3,
+                leader_id: node("node-2"),
+                prev_log_index: 8,
+                prev_log_term: 3,
+                commit_index: 6,
+            }))
+            .unwrap();
+
+        let Effect::RejectAppendEntries { peer, response } = effect else {
+            panic!("an older leader term must be rejected");
+        };
+
+        assert_eq!(peer, node("node-2"));
+        assert_eq!(response.term, 4);
+        assert_eq!(response.success, false);
+        assert_eq!(response.last_log_index, 8);
+        assert_eq!(response.last_log_term, 3);
+        assert_eq!(raft.current_term, 4);
+        assert_eq!(raft.leader_id, Some(node("old-leader")));
+    }
+
+    #[test]
+    fn append_entries_rejects_a_missing_previous_log_entry() {
+        let mut raft = follower(4, None, 8, 3);
+
+        let effect = raft
+            .handle(Event::AppendEntries(AppendEntriesRequest {
+                term: 4,
+                leader_id: node("node-2"),
+                prev_log_index: 9,
+                prev_log_term: 3,
+                commit_index: 6,
+            }))
+            .unwrap();
+
+        let Effect::RejectAppendEntries { peer, response } = effect else {
+            panic!("a missing previous log entry must be rejected");
+        };
+
+        assert_eq!(peer, node("node-2"));
+        assert_eq!(response.term, 4);
+        assert_eq!(response.success, false);
+        assert_eq!(response.last_log_index, 8);
+        assert_eq!(response.last_log_term, 3);
+    }
+
+    #[test]
+    fn append_entries_accepts_a_matching_log_prefix() {
+        let mut raft = follower(4, None, 8, 3);
+
+        let effect = raft
+            .handle(Event::AppendEntries(AppendEntriesRequest {
+                term: 4,
+                leader_id: node("node-2"),
+                prev_log_index: 8,
+                prev_log_term: 3,
+                commit_index: 6,
+            }))
+            .unwrap();
+
+        let Effect::ProcessAppendEntries {
+            peer,
+            response,
+            apply_through,
+        } = effect
+        else {
+            panic!("a matching log prefix must be accepted");
+        };
+
+        assert_eq!(peer, node("node-2"));
+        assert_eq!(response.term, 4);
+        assert_eq!(response.success, true);
+        assert_eq!(apply_through, 6);
+        assert_eq!(raft.leader_id, Some(node("node-2")));
+        assert_eq!(raft.role, Role::Follower);
+    }
+
+    #[test]
+    fn append_entries_never_applies_beyond_the_local_log() {
+        let mut raft = follower(4, None, 8, 3);
+
+        let effect = raft
+            .handle(Event::AppendEntries(AppendEntriesRequest {
+                term: 4,
+                leader_id: node("node-2"),
+                prev_log_index: 8,
+                prev_log_term: 3,
+                commit_index: 12,
+            }))
+            .unwrap();
+
+        let Effect::ProcessAppendEntries { apply_through, .. } = effect else {
+            panic!("a matching log prefix must be accepted");
+        };
+
+        assert_eq!(apply_through, 8);
+    }
+
+    #[test]
+    fn append_entries_from_a_newer_term_makes_a_candidate_step_down() {
+        let local_node = node("node-1");
+        let mut raft = follower(4, Some(local_node), 8, 3);
+        raft.role = Role::Candidate;
+
+        let effect = raft
+            .handle(Event::AppendEntries(AppendEntriesRequest {
+                term: 5,
+                leader_id: node("node-2"),
+                prev_log_index: 8,
+                prev_log_term: 3,
+                commit_index: 6,
+            }))
+            .unwrap();
+
+        assert!(matches!(effect, Effect::ProcessAppendEntries { .. }));
+        assert_eq!(raft.current_term, 5);
+        assert_eq!(raft.role, Role::Follower);
+        assert_eq!(raft.voted_for, None);
+        assert_eq!(raft.leader_id, Some(node("node-2")));
     }
 }
