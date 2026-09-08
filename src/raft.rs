@@ -1,84 +1,8 @@
 // Implement the Raft core here, one step at a time.
+use std::cmp::min;
 
-use std::{
-    cmp::min,
-    collections::{HashMap, HashSet},
-};
-
-use serf::net::Node;
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct NodeId(String);
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum Role {
-    Candidate,
-    Follower,
-    Leader,
-}
-
-pub enum Event {
-    ElectionTimeout,
-    RequestVote(VoteRequest),
-    HeartbeatTimeout,
-    AppendEntries(AppendEntriesRequest),
-    AppendProcessed(AppendProcessed),
-}
-
-pub enum Effect {
-    SendRequestVotes {
-        peers: Vec<NodeId>,
-        request: VoteRequest,
-    },
-    SendRequestVoteResponse {
-        peer: NodeId,
-        response: VoteResponse,
-    },
-    SendHeartbeat {
-        peers: Vec<NodeId>,
-        request: HeartbeatRequest,
-    },
-    ProcessAppendEntries {
-        peer: NodeId,
-        response: AppendEntriesResponse,
-        apply_through: u64,
-    },
-    RejectAppendEntries {
-        peer: NodeId,
-        response: AppendEntriesResponse,
-    },
-    TruncateAppendEntries {
-        peer: NodeId,
-        response: AppendEntriesResponse,
-    },
-}
-
-struct Raft {
-    id: NodeId,
-    voters: HashMap<NodeId, Progress>,
-    learners: HashMap<NodeId, Progress>,
-    role: Role,
-    current_term: u64,
-    leader_id: Option<NodeId>,
-    voted_for: Option<NodeId>,
-    last_applied: u64,
-    commit_index: u64,
-    last_log_index: u64,
-    last_log_term: u64,
-}
-
-struct Progress {
-    next_index: u64,
-    match_index: u64,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("node is not the leader")]
-    NotLeader,
-}
-
-type Result<T> = std::result::Result<T, Error>;
+mod types;
+use self::types::*;
 
 impl Raft {
     fn handle(&mut self, ev: Event) -> Result<Option<Effect>> {
@@ -91,6 +15,7 @@ impl Raft {
                 self.handle_append_processed(req)?;
                 Ok(None)
             }
+            Event::VoteResponse(req) => self.handled_vote_response(req),
         }
     }
 
@@ -261,52 +186,20 @@ impl Raft {
         self.last_log_index = append_processed.last_log_index;
         Ok(())
     }
-}
 
-pub struct VoteRequest {
-    term: u64,
-    candidate_id: NodeId,
-    last_log_index: u64,
-    last_log_term: u64,
-}
-
-pub struct HeartbeatRequest {
-    term: u64,
-    leader_id: NodeId,
-    log_index: u64,
-    log_term: u64,
-    leader_commit_index: u64,
-}
-
-pub struct VoteResponse {
-    term: u64,
-    vote_granted: bool,
-}
-
-pub struct AppendEntriesRequest {
-    term: u64,
-    leader_id: NodeId,
-    prev_log_index: u64,
-    prev_log_term: u64,
-    commit_index: u64,
-}
-
-pub struct AppendEntriesResponse {
-    term: u64,
-    success: bool,
-    last_log_index: u64,
-    last_log_term: u64,
-}
-
-pub struct AppendProcessed {
-    last_log_index: u64,
-    applied_through: Option<u64>,
+    fn handled_vote_response(
+        &mut self,
+        vote_response: ReceivedVoteResponse,
+    ) -> Result<Option<Effect>> {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use std::collections::{HashMap, HashSet};
 
     fn node(id: &str) -> NodeId {
         NodeId(id.to_owned())
