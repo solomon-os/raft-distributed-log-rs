@@ -2,6 +2,8 @@
 use std::cmp::min;
 
 mod types;
+use crate::raft::types::Error::NotCandidate;
+
 use self::types::*;
 
 impl Raft {
@@ -15,12 +17,13 @@ impl Raft {
                 self.handle_append_processed(req)?;
                 Ok(None)
             }
-            Event::VoteResponse(req) => self.handled_vote_response(req),
+            Event::VoteResponse(req) => self.handle_vote_response(req),
         }
     }
 
     fn handle_election_timeout(&mut self) -> Result<Effect> {
         self.current_term += 1;
+        self.current_votes = 1;
         self.voted_for = Some(self.id.clone());
 
         let peers = self
@@ -187,10 +190,39 @@ impl Raft {
         Ok(())
     }
 
-    fn handled_vote_response(
+    fn handle_vote_response(
         &mut self,
         vote_response: ReceivedVoteResponse,
     ) -> Result<Option<Effect>> {
+        if self.role != Role::Candidate {
+            return Err(NotCandidate);
+        }
+
+        if vote_response.response.vote_granted {
+            self.current_votes += 1;
+            if self.role != Role::Leader {
+                if self.current_votes > self.voters.len() as u64 / 2 {
+                    // make leader and return heartbeat;
+                    self.role = Role::Leader;
+                    return Ok(Some(Effect::SendHeartbeat {
+                        peers: self
+                            .voters
+                            .keys()
+                            .filter(|node_id| *node_id != &self.id)
+                            .cloned()
+                            .collect(),
+                        request: HeartbeatRequest {
+                            term: self.current_term,
+                            leader_id: self.id.clone(),
+                            log_index: self.last_log_index,
+                            log_term: self.last_log_term,
+                            leader_commit_index: self.commit_index,
+                        },
+                    }));
+                }
+            }
+        }
+
         Ok(None)
     }
 }
@@ -236,6 +268,7 @@ mod tests {
             last_log_index,
             last_log_term,
             leader_id: Some(node("old-leader")),
+            current_votes: 0,
         }
     }
 
@@ -284,6 +317,7 @@ mod tests {
             last_log_index: 8,
             last_log_term: 2,
             leader_id: Some(node("old-leader")),
+            current_votes: 0,
         };
 
         let effect = raft
@@ -330,6 +364,7 @@ mod tests {
             last_log_index: 8,
             last_log_term: 2,
             leader_id: Some(node("old-leader")),
+            current_votes: 0,
         };
 
         let effect = raft
@@ -579,5 +614,78 @@ mod tests {
         assert!(effect.is_none());
         assert_eq!(raft.last_log_index, 8);
         assert_eq!(raft.last_applied, 3);
+    }
+
+    #[test]
+    fn granted_vote_that_reaches_a_majority_makes_candidate_leader() {
+        let local_node = node("node-1");
+        let mut raft = follower(4, Some(local_node.clone()), 8, 3);
+        raft.role = Role::Candidate;
+        raft.current_votes = 1;
+
+        let effect = raft
+            .handle(Event::VoteResponse(ReceivedVoteResponse {
+                from: node("node-2"),
+                response: VoteResponse {
+                    term: 4,
+                    vote_granted: true,
+                },
+            }))
+            .unwrap();
+
+        assert_eq!(raft.current_votes, 2);
+        assert_eq!(raft.role, Role::Leader);
+
+        let effect = effect.expect("a newly elected leader must send an initial heartbeat");
+
+        let Effect::SendHeartbeat { peers, request } = effect else {
+            panic!("winning an election must send an initial heartbeat");
+        };
+
+        assert_eq!(request.term, 4);
+        assert_eq!(request.leader_id, local_node);
+        assert_eq!(
+            peers.into_iter().collect::<HashSet<_>>(),
+            HashSet::from([node("node-2"), node("node-3")])
+        );
+    }
+
+    #[test]
+    fn denied_vote_does_not_change_candidate_votes() {
+        let local_node = node("node-1");
+        let mut raft = follower(4, Some(local_node), 8, 3);
+        raft.role = Role::Candidate;
+        raft.current_votes = 1;
+
+        let effect = raft
+            .handle(Event::VoteResponse(ReceivedVoteResponse {
+                from: node("node-2"),
+                response: VoteResponse {
+                    term: 4,
+                    vote_granted: false,
+                },
+            }))
+            .unwrap();
+
+        assert!(effect.is_none());
+        assert_eq!(raft.current_votes, 1);
+        assert_eq!(raft.role, Role::Candidate);
+    }
+
+    #[test]
+    fn vote_response_is_rejected_when_node_is_not_a_candidate() {
+        let mut raft = follower(4, None, 8, 3);
+
+        let result = raft.handle(Event::VoteResponse(ReceivedVoteResponse {
+            from: node("node-2"),
+            response: VoteResponse {
+                term: 4,
+                vote_granted: true,
+            },
+        }));
+
+        assert!(matches!(result, Err(Error::NotCandidate)));
+        assert_eq!(raft.current_votes, 0);
+        assert_eq!(raft.role, Role::Follower);
     }
 }

@@ -49,6 +49,7 @@ pub enum Effect {
     },
 }
 
+#[derive(Debug)]
 pub struct Raft {
     pub(super) id: NodeId,
     pub(super) voters: HashMap<NodeId, Progress>,
@@ -61,8 +62,10 @@ pub struct Raft {
     pub(super) commit_index: u64,
     pub(super) last_log_index: u64,
     pub(super) last_log_term: u64,
+    pub(super) current_votes: u64,
 }
 
+#[derive(Debug)]
 pub(super) struct Progress {
     pub(super) next_index: u64,
     pub(super) match_index: u64,
@@ -72,6 +75,8 @@ pub(super) struct Progress {
 pub enum Error {
     #[error("node is not the leader")]
     NotLeader,
+    #[error("node is not a candidate")]
+    NotCandidate,
 }
 
 pub struct VoteRequest {
@@ -89,6 +94,7 @@ pub struct HeartbeatRequest {
     pub(super) leader_commit_index: u64,
 }
 
+#[derive(Debug)]
 pub struct VoteResponse {
     pub(super) term: u64,
     pub(super) vote_granted: bool,
@@ -114,6 +120,7 @@ pub struct AppendProcessed {
     pub(super) applied_through: Option<u64>,
 }
 
+#[derive(Debug)]
 pub struct ReceivedVoteResponse {
     pub(super) from: NodeId,
     pub(super) response: VoteResponse,
