@@ -22,6 +22,7 @@ pub enum Event {
     RequestVote(VoteRequest),
     HeartbeatTimeout,
     AppendEntries(AppendEntriesRequest),
+    AppendProcessed(AppendProcessed),
 }
 
 pub enum Effect {
@@ -80,12 +81,16 @@ pub enum Error {
 type Result<T> = std::result::Result<T, Error>;
 
 impl Raft {
-    fn handle(&mut self, ev: Event) -> Result<Effect> {
+    fn handle(&mut self, ev: Event) -> Result<Option<Effect>> {
         match ev {
-            Event::ElectionTimeout => self.handle_election_timeout(),
-            Event::RequestVote(vote_request) => self.handle_request_vote(vote_request),
-            Event::HeartbeatTimeout => self.handle_heartbeat_timeout(),
-            Event::AppendEntries(append_request) => self.handle_append_entry(append_request),
+            Event::ElectionTimeout => self.handle_election_timeout().map(Some),
+            Event::RequestVote(req) => self.handle_request_vote(req).map(Some),
+            Event::HeartbeatTimeout => self.handle_heartbeat_timeout().map(Some),
+            Event::AppendEntries(req) => self.handle_append_entries(req).map(Some),
+            Event::AppendProcessed(req) => {
+                self.handle_append_processed(req)?;
+                Ok(None)
+            }
         }
     }
 
@@ -186,7 +191,7 @@ impl Raft {
         })
     }
 
-    fn handle_append_entry(&mut self, append_request: AppendEntriesRequest) -> Result<Effect> {
+    fn handle_append_entries(&mut self, append_request: AppendEntriesRequest) -> Result<Effect> {
         if append_request.term < self.current_term {
             return Ok(Effect::RejectAppendEntries {
                 peer: append_request.leader_id,
@@ -248,6 +253,14 @@ impl Raft {
             apply_through: min(self.last_log_index, append_request.commit_index),
         })
     }
+
+    fn handle_append_processed(&mut self, append_processed: AppendProcessed) -> Result<()> {
+        if let Some(applied_through) = append_processed.applied_through {
+            self.last_applied = applied_through;
+        }
+        self.last_log_index = append_processed.last_log_index;
+        Ok(())
+    }
 }
 
 pub struct VoteRequest {
@@ -283,6 +296,11 @@ pub struct AppendEntriesResponse {
     success: bool,
     last_log_index: u64,
     last_log_term: u64,
+}
+
+pub struct AppendProcessed {
+    last_log_index: u64,
+    applied_through: Option<u64>,
 }
 
 #[cfg(test)]
@@ -342,7 +360,8 @@ mod tests {
                 last_log_index,
                 last_log_term,
             }))
-            .unwrap();
+            .unwrap()
+            .expect("RequestVote must produce an effect");
 
         match effect {
             Effect::SendRequestVoteResponse { peer, response } => {
@@ -374,7 +393,10 @@ mod tests {
             leader_id: Some(node("old-leader")),
         };
 
-        let effect = raft.handle(Event::ElectionTimeout).unwrap();
+        let effect = raft
+            .handle(Event::ElectionTimeout)
+            .unwrap()
+            .expect("ElectionTimeout must produce an effect");
 
         assert_eq!(raft.role, Role::Candidate);
         assert_eq!(raft.current_term, 3);
@@ -417,7 +439,10 @@ mod tests {
             leader_id: Some(node("old-leader")),
         };
 
-        let effect = raft.handle(Event::ElectionTimeout).unwrap();
+        let effect = raft
+            .handle(Event::ElectionTimeout)
+            .unwrap()
+            .expect("ElectionTimeout must produce an effect");
 
         let Effect::SendRequestVotes { peers, .. } = effect else {
             panic!("ElectionTimeout must produce vote requests");
@@ -509,7 +534,8 @@ mod tests {
                 prev_log_term: 3,
                 commit_index: 6,
             }))
-            .unwrap();
+            .unwrap()
+            .expect("AppendEntries must produce an effect");
 
         let Effect::RejectAppendEntries { peer, response } = effect else {
             panic!("an older leader term must be rejected");
@@ -536,7 +562,8 @@ mod tests {
                 prev_log_term: 3,
                 commit_index: 6,
             }))
-            .unwrap();
+            .unwrap()
+            .expect("AppendEntries must produce an effect");
 
         let Effect::RejectAppendEntries { peer, response } = effect else {
             panic!("a missing previous log entry must be rejected");
@@ -561,7 +588,8 @@ mod tests {
                 prev_log_term: 3,
                 commit_index: 6,
             }))
-            .unwrap();
+            .unwrap()
+            .expect("AppendEntries must produce an effect");
 
         let Effect::ProcessAppendEntries {
             peer,
@@ -592,7 +620,8 @@ mod tests {
                 prev_log_term: 3,
                 commit_index: 12,
             }))
-            .unwrap();
+            .unwrap()
+            .expect("AppendEntries must produce an effect");
 
         let Effect::ProcessAppendEntries { apply_through, .. } = effect else {
             panic!("a matching log prefix must be accepted");
@@ -615,12 +644,47 @@ mod tests {
                 prev_log_term: 3,
                 commit_index: 6,
             }))
-            .unwrap();
+            .unwrap()
+            .expect("AppendEntries must produce an effect");
 
         assert!(matches!(effect, Effect::ProcessAppendEntries { .. }));
         assert_eq!(raft.current_term, 5);
         assert_eq!(raft.role, Role::Follower);
         assert_eq!(raft.voted_for, None);
         assert_eq!(raft.leader_id, Some(node("node-2")));
+    }
+
+    #[test]
+    fn append_processed_updates_log_and_applied_indexes() {
+        let mut raft = follower(4, None, 5, 2);
+        raft.last_applied = 3;
+
+        let effect = raft
+            .handle(Event::AppendProcessed(AppendProcessed {
+                last_log_index: 8,
+                applied_through: Some(6),
+            }))
+            .unwrap();
+
+        assert!(effect.is_none());
+        assert_eq!(raft.last_log_index, 8);
+        assert_eq!(raft.last_applied, 6);
+    }
+
+    #[test]
+    fn append_processed_without_application_preserves_last_applied() {
+        let mut raft = follower(4, None, 5, 2);
+        raft.last_applied = 3;
+
+        let effect = raft
+            .handle(Event::AppendProcessed(AppendProcessed {
+                last_log_index: 8,
+                applied_through: None,
+            }))
+            .unwrap();
+
+        assert!(effect.is_none());
+        assert_eq!(raft.last_log_index, 8);
+        assert_eq!(raft.last_applied, 3);
     }
 }
