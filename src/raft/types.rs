@@ -14,17 +14,24 @@ pub enum Role {
 
 pub enum Event {
     ElectionTimeout,
-    RequestVote(VoteRequest),
     HeartbeatTimeout,
+    RequestVote(VoteRequest),
     AppendEntries(AppendEntriesRequest),
-    AppendProcessed(AppendProcessed),
+    EntriesPersisted(PersistedEntries),
+    EntriesApplied(AppliedEntries),
     VoteResponse(ReceivedVoteResponse),
+    HeartbeatResponse(ReceivedHeartbeatResponse),
+    LocalEntriesAppended(LocalEntry),
+    Write,
 }
 
 pub enum Effect {
     SendRequestVotes {
         peers: Vec<NodeId>,
         request: VoteRequest,
+    },
+    SendAppendEntries {
+        targets: Vec<ReplicationTarget>,
     },
     SendRequestVoteResponse {
         peer: NodeId,
@@ -34,18 +41,22 @@ pub enum Effect {
         peers: Vec<NodeId>,
         request: HeartbeatRequest,
     },
-    ProcessAppendEntries {
+    PersistEntries {
         peer: NodeId,
         response: AppendEntriesResponse,
-        apply_through: u64,
+        truncate_after: Option<u64>,
+        leader_commit_index: u64,
+    },
+    ApplyCommitted {
+        through: u64,
     },
     RejectAppendEntries {
         peer: NodeId,
         response: AppendEntriesResponse,
     },
-    TruncateAppendEntries {
-        peer: NodeId,
-        response: AppendEntriesResponse,
+    AppendLocal {
+        term: u64,
+        last_log_index: u64,
     },
 }
 
@@ -74,7 +85,7 @@ pub(super) struct Progress {
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("node is not the leader")]
-    NotLeader,
+    NotLeader(Option<NodeId>),
     #[error("node is not a candidate")]
     NotCandidate,
 }
@@ -115,13 +126,36 @@ pub struct AppendEntriesResponse {
     pub(super) last_log_term: u64,
 }
 
-pub struct AppendProcessed {
+pub struct PersistedEntries {
     pub(super) last_log_index: u64,
-    pub(super) applied_through: Option<u64>,
+    pub(super) last_log_term: u64,
+    pub(super) leader_commit_index: u64,
+}
+
+pub struct AppliedEntries {
+    pub(super) through: u64,
 }
 
 #[derive(Debug)]
 pub struct ReceivedVoteResponse {
     pub(super) from: NodeId,
     pub(super) response: VoteResponse,
+}
+
+pub struct ReceivedHeartbeatResponse {
+    pub(super) from: NodeId,
+    pub(super) response: AppendEntriesResponse,
+}
+
+pub struct LocalEntry {
+    pub(super) index: u64,
+    pub(super) term: u64,
+}
+
+pub struct ReplicationTarget {
+    pub(super) peer: NodeId,
+    pub(super) last_log_index: u64,
+    pub(super) last_log_term: u64,
+    pub(super) leader_id: NodeId,
+    pub(super) leader_commit_index: u64,
 }

@@ -9,15 +9,21 @@ use self::types::*;
 impl Raft {
     fn handle(&mut self, ev: Event) -> Result<Option<Effect>> {
         match ev {
-            Event::ElectionTimeout => self.handle_election_timeout().map(Some),
-            Event::RequestVote(req) => self.handle_request_vote(req).map(Some),
-            Event::HeartbeatTimeout => self.handle_heartbeat_timeout().map(Some),
-            Event::AppendEntries(req) => self.handle_append_entries(req).map(Some),
-            Event::AppendProcessed(req) => {
-                self.handle_append_processed(req)?;
+            Event::Write => self.handle_write().map(Some),
+            Event::LocalEntriesAppended(local_entry) => {
+                self.handle_local_entry_appended(local_entry).map(Some)
+            }
+            Event::EntriesPersisted(entries) => self.handle_entries_persisted(entries),
+            Event::EntriesApplied(entries) => {
+                self.handle_entries_applied(entries)?;
                 Ok(None)
             }
+            Event::RequestVote(req) => self.handle_request_vote(req).map(Some),
+            Event::AppendEntries(req) => self.handle_append_entries(req).map(Some),
             Event::VoteResponse(req) => self.handle_vote_response(req),
+            Event::HeartbeatResponse(response) => self.handle_heartbeat_response(response),
+            Event::ElectionTimeout => self.handle_election_timeout().map(Some),
+            Event::HeartbeatTimeout => self.handle_heartbeat_timeout().map(Some),
         }
     }
 
@@ -100,7 +106,7 @@ impl Raft {
 
     fn handle_heartbeat_timeout(&self) -> Result<Effect> {
         if self.role != Role::Leader {
-            return Err(Error::NotLeader);
+            return Err(Error::NotLeader(self.leader_id.clone()));
         }
         Ok(Effect::SendHeartbeat {
             peers: self
@@ -154,7 +160,7 @@ impl Raft {
                 self.role = Role::Follower;
                 self.current_term = append_request.term;
                 self.leader_id = Some(append_request.leader_id.clone());
-                return Ok(Effect::TruncateAppendEntries {
+                return Ok(Effect::PersistEntries {
                     peer: append_request.leader_id,
                     response: AppendEntriesResponse {
                         last_log_index: append_request.prev_log_index,
@@ -162,6 +168,8 @@ impl Raft {
                         success: true,
                         term: self.current_term,
                     },
+                    leader_commit_index: append_request.commit_index,
+                    truncate_after: Some(append_request.prev_log_index),
                 });
             }
         }
@@ -170,7 +178,7 @@ impl Raft {
         self.role = Role::Follower;
         self.leader_id = Some(append_request.leader_id.clone());
 
-        Ok(Effect::ProcessAppendEntries {
+        Ok(Effect::PersistEntries {
             peer: append_request.leader_id,
             response: AppendEntriesResponse {
                 last_log_index: self.last_log_index,
@@ -178,16 +186,83 @@ impl Raft {
                 success: true,
                 term: self.current_term,
             },
-            apply_through: min(self.last_log_index, append_request.commit_index),
+            leader_commit_index: append_request.commit_index,
+            truncate_after: None,
         })
     }
 
-    fn handle_append_processed(&mut self, append_processed: AppendProcessed) -> Result<()> {
-        if let Some(applied_through) = append_processed.applied_through {
-            self.last_applied = applied_through;
+    fn handle_entries_persisted(&mut self, entries: PersistedEntries) -> Result<Option<Effect>> {
+        self.last_log_index = entries.last_log_index;
+        self.last_log_term = entries.last_log_term;
+
+        let new_commit_index = min(entries.leader_commit_index, self.last_log_index);
+        if new_commit_index > self.commit_index {
+            self.commit_index = new_commit_index;
+            return Ok(Some(Effect::ApplyCommitted {
+                through: self.commit_index,
+            }));
         }
-        self.last_log_index = append_processed.last_log_index;
-        Ok(())
+        Ok(None)
+    }
+
+    fn handle_entries_applied(&mut self, entries: AppliedEntries) -> Result<Option<Effect>> {
+        self.last_applied = entries.through;
+        if self.role == Role::Leader {
+            return Ok(Some(Effect::SendHeartbeat {
+                peers: self
+                    .voters
+                    .keys()
+                    .filter(|node_id| *node_id != &self.id)
+                    .cloned()
+                    .collect(),
+                request: HeartbeatRequest {
+                    term: self.current_term,
+                    leader_id: self.id.clone(),
+                    log_index: self.last_log_index,
+                    log_term: self.last_log_term,
+                    leader_commit_index: self.commit_index,
+                },
+            }));
+        }
+        Ok(None)
+    }
+
+    fn handle_local_entry_appended(&mut self, entry: LocalEntry) -> Result<Effect> {
+        if self.role != Role::Leader {
+            return Err(Error::NotLeader(self.leader_id.clone()));
+        }
+
+        let targets = self
+            .voters
+            .iter()
+            .chain(self.learners.iter())
+            .filter(|(node_id, _)| *node_id != &self.id)
+            .map(|(node_id, progress)| {
+                let last_log_index = min(progress.match_index, self.last_log_index);
+                // to be filed by the executor.
+                let last_log_term = self.last_log_term;
+
+                ReplicationTarget {
+                    peer: node_id.clone(),
+                    last_log_index,
+                    last_log_term,
+                    leader_id: self.id.clone(),
+                    leader_commit_index: self.commit_index,
+                }
+            })
+            .collect();
+
+        self.last_log_index = entry.index;
+        self.last_log_term = entry.term;
+
+        let leader_progress = self
+            .voters
+            .get_mut(&self.id)
+            .expect("leader mut be present in voters");
+        leader_progress.match_index = self.last_log_index;
+        leader_progress.next_index = self.last_log_index + 1;
+
+        Ok(Effect::SendAppendEntries { targets })
     }
 
     fn handle_vote_response(
@@ -224,6 +299,61 @@ impl Raft {
         }
 
         Ok(None)
+    }
+
+    fn handle_heartbeat_response(
+        &mut self,
+        received: ReceivedHeartbeatResponse,
+    ) -> Result<Option<Effect>> {
+        if received.response.term > self.current_term {
+            self.current_term = received.response.term;
+            self.role = Role::Follower;
+            self.voted_for = None;
+            self.leader_id = None;
+            self.current_votes = 0;
+            return Ok(None);
+        }
+
+        if self.role != Role::Leader {
+            return Err(Error::NotLeader(self.leader_id.clone()));
+        }
+
+        if received.response.term < self.current_term {
+            return Ok(None);
+        }
+
+        let progress = self
+            .voters
+            .get_mut(&received.from)
+            .or_else(|| self.learners.get_mut(&received.from));
+
+        let Some(progress) = progress else {
+            return Ok(None);
+        };
+
+        if received.response.success {
+            let matched_index = min(received.response.last_log_index, self.last_log_index);
+            progress.match_index = progress.match_index.max(matched_index);
+            progress.next_index = progress
+                .next_index
+                .max(progress.match_index.saturating_add(1));
+        } else {
+            let previous_index = progress.next_index.saturating_sub(1);
+            let follower_next_index = received.response.last_log_index.saturating_add(1);
+            progress.next_index = min(previous_index, follower_next_index);
+        }
+
+        Ok(None)
+    }
+
+    fn handle_write(&self) -> Result<Effect> {
+        if self.role != Role::Leader {
+            return Err(Error::NotLeader(self.leader_id.clone()));
+        }
+        Ok(Effect::AppendLocal {
+            term: self.current_term,
+            last_log_index: self.last_log_index,
+        })
     }
 }
 
@@ -519,10 +649,11 @@ mod tests {
             .unwrap()
             .expect("AppendEntries must produce an effect");
 
-        let Effect::ProcessAppendEntries {
+        let Effect::PersistEntries {
             peer,
             response,
-            apply_through,
+            truncate_after,
+            leader_commit_index,
         } = effect
         else {
             panic!("a matching log prefix must be accepted");
@@ -531,13 +662,14 @@ mod tests {
         assert_eq!(peer, node("node-2"));
         assert_eq!(response.term, 4);
         assert_eq!(response.success, true);
-        assert_eq!(apply_through, 6);
+        assert_eq!(truncate_after, None);
+        assert_eq!(leader_commit_index, 6);
         assert_eq!(raft.leader_id, Some(node("node-2")));
         assert_eq!(raft.role, Role::Follower);
     }
 
     #[test]
-    fn append_entries_never_applies_beyond_the_local_log() {
+    fn append_entries_passes_leader_commit_index_to_persistence() {
         let mut raft = follower(4, None, 8, 3);
 
         let effect = raft
@@ -551,11 +683,15 @@ mod tests {
             .unwrap()
             .expect("AppendEntries must produce an effect");
 
-        let Effect::ProcessAppendEntries { apply_through, .. } = effect else {
+        let Effect::PersistEntries {
+            leader_commit_index,
+            ..
+        } = effect
+        else {
             panic!("a matching log prefix must be accepted");
         };
 
-        assert_eq!(apply_through, 8);
+        assert_eq!(leader_commit_index, 12);
     }
 
     #[test]
@@ -575,7 +711,7 @@ mod tests {
             .unwrap()
             .expect("AppendEntries must produce an effect");
 
-        assert!(matches!(effect, Effect::ProcessAppendEntries { .. }));
+        assert!(matches!(effect, Effect::PersistEntries { .. }));
         assert_eq!(raft.current_term, 5);
         assert_eq!(raft.role, Role::Follower);
         assert_eq!(raft.voted_for, None);
@@ -583,37 +719,231 @@ mod tests {
     }
 
     #[test]
-    fn append_processed_updates_log_and_applied_indexes() {
+    fn append_entries_uses_persist_effect_when_truncation_is_required() {
+        let mut raft = follower(4, None, 8, 3);
+
+        let effect = raft
+            .handle(Event::AppendEntries(AppendEntriesRequest {
+                term: 5,
+                leader_id: node("node-2"),
+                prev_log_index: 5,
+                prev_log_term: 2,
+                commit_index: 4,
+            }))
+            .unwrap()
+            .expect("accepted AppendEntries must produce an effect");
+
+        let Effect::PersistEntries {
+            response,
+            truncate_after,
+            leader_commit_index,
+            ..
+        } = effect
+        else {
+            panic!("accepted AppendEntries must be persisted");
+        };
+
+        assert_eq!(response.success, true);
+        assert_eq!(truncate_after, Some(5));
+        assert_eq!(leader_commit_index, 4);
+    }
+
+    #[test]
+    fn entries_persisted_advances_commit_and_requests_application() {
         let mut raft = follower(4, None, 5, 2);
         raft.last_applied = 3;
 
         let effect = raft
-            .handle(Event::AppendProcessed(AppendProcessed {
+            .handle(Event::EntriesPersisted(PersistedEntries {
                 last_log_index: 8,
-                applied_through: Some(6),
+                last_log_term: 4,
+                leader_commit_index: 6,
             }))
+            .unwrap()
+            .expect("a newly committed range must be applied");
+
+        assert_eq!(raft.last_log_index, 8);
+        assert_eq!(raft.last_log_term, 4);
+        assert_eq!(raft.commit_index, 6);
+        assert_eq!(raft.last_applied, 3);
+
+        let Effect::ApplyCommitted { through } = effect else {
+            panic!("persisting committed entries must request application");
+        };
+
+        assert_eq!(through, 6);
+    }
+
+    #[test]
+    fn entries_applied_updates_last_applied() {
+        let mut raft = follower(4, None, 5, 2);
+        raft.last_applied = 3;
+
+        let effect = raft
+            .handle(Event::EntriesApplied(AppliedEntries { through: 6 }))
             .unwrap();
 
         assert!(effect.is_none());
-        assert_eq!(raft.last_log_index, 8);
         assert_eq!(raft.last_applied, 6);
     }
 
     #[test]
-    fn append_processed_without_application_preserves_last_applied() {
+    fn entries_persisted_never_commits_beyond_the_local_log() {
         let mut raft = follower(4, None, 5, 2);
-        raft.last_applied = 3;
 
         let effect = raft
-            .handle(Event::AppendProcessed(AppendProcessed {
+            .handle(Event::EntriesPersisted(PersistedEntries {
                 last_log_index: 8,
-                applied_through: None,
+                last_log_term: 4,
+                leader_commit_index: 12,
             }))
-            .unwrap();
+            .unwrap()
+            .expect("newly committed entries must be applied");
 
-        assert!(effect.is_none());
+        assert_eq!(raft.commit_index, 8);
+
+        let Effect::ApplyCommitted { through } = effect else {
+            panic!("persisting committed entries must request application");
+        };
+
+        assert_eq!(through, 8);
+    }
+
+    #[test]
+    fn write_on_leader_requests_a_local_append() {
+        let mut raft = follower(4, Some(node("node-1")), 8, 3);
+        raft.role = Role::Leader;
+
+        let effect = raft
+            .handle(Event::Write)
+            .unwrap()
+            .expect("a leader write must produce an effect");
+
+        let Effect::AppendLocal {
+            term,
+            last_log_index,
+        } = effect
+        else {
+            panic!("a leader write must append locally first");
+        };
+
+        assert_eq!(term, 4);
+        assert_eq!(last_log_index, 8);
         assert_eq!(raft.last_log_index, 8);
-        assert_eq!(raft.last_applied, 3);
+    }
+
+    #[test]
+    fn write_on_follower_returns_known_leader() {
+        let mut raft = follower(4, None, 8, 3);
+
+        let result = raft.handle(Event::Write);
+
+        assert!(matches!(
+            result,
+            Err(Error::NotLeader(Some(leader))) if leader == node("old-leader")
+        ));
+        assert_eq!(raft.last_log_index, 8);
+    }
+
+    #[test]
+    fn local_entry_append_updates_leader_log_and_own_progress() {
+        let local_node = node("node-1");
+        let mut raft = follower(4, Some(local_node.clone()), 8, 3);
+        raft.role = Role::Leader;
+
+        raft.handle(Event::LocalEntriesAppended(LocalEntry {
+            index: 9,
+            term: 4,
+        }))
+        .unwrap();
+
+        let leader_progress = raft.voters.get(&local_node).unwrap();
+        assert_eq!(raft.last_log_index, 9);
+        assert_eq!(raft.last_log_term, 4);
+        assert_eq!(leader_progress.match_index, 9);
+        assert_eq!(leader_progress.next_index, 10);
+    }
+
+    #[test]
+    fn local_entry_append_creates_a_replication_target_for_every_other_node() {
+        let local_node = node("node-1");
+        let mut raft = follower(4, Some(local_node.clone()), 8, 3);
+        raft.role = Role::Leader;
+        raft.commit_index = 6;
+        raft.voters.insert(
+            node("node-2"),
+            Progress {
+                next_index: 6,
+                match_index: 5,
+            },
+        );
+        raft.voters.insert(
+            node("node-3"),
+            Progress {
+                next_index: 9,
+                match_index: 8,
+            },
+        );
+        raft.learners.insert(
+            node("node-4"),
+            Progress {
+                next_index: 3,
+                match_index: 2,
+            },
+        );
+
+        let effect = raft
+            .handle(Event::LocalEntriesAppended(LocalEntry {
+                index: 9,
+                term: 4,
+            }))
+            .unwrap()
+            .expect("a persisted local entry must be replicated");
+
+        let Effect::SendAppendEntries { targets } = effect else {
+            panic!("a persisted local entry must produce replication targets");
+        };
+
+        let targets: HashMap<_, _> = targets
+            .into_iter()
+            .map(|target| {
+                (
+                    target.peer,
+                    (
+                        target.last_log_index,
+                        target.last_log_term,
+                        target.leader_id,
+                        target.leader_commit_index,
+                    ),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            targets,
+            HashMap::from([
+                (node("node-2"), (5, 3, local_node.clone(), 6)),
+                (node("node-3"), (8, 3, local_node.clone(), 6)),
+                (node("node-4"), (2, 3, local_node, 6)),
+            ])
+        );
+    }
+
+    #[test]
+    fn local_entry_append_is_rejected_after_leader_steps_down() {
+        let mut raft = follower(5, None, 8, 3);
+
+        let result = raft.handle(Event::LocalEntriesAppended(LocalEntry {
+            index: 9,
+            term: 4,
+        }));
+
+        assert!(matches!(
+            result,
+            Err(Error::NotLeader(Some(leader))) if leader == node("old-leader")
+        ));
+        assert_eq!(raft.last_log_index, 8);
+        assert_eq!(raft.last_log_term, 3);
     }
 
     #[test]
@@ -687,5 +1017,91 @@ mod tests {
         assert!(matches!(result, Err(Error::NotCandidate)));
         assert_eq!(raft.current_votes, 0);
         assert_eq!(raft.role, Role::Follower);
+    }
+
+    #[test]
+    fn successful_heartbeat_response_updates_peer_progress() {
+        let mut raft = follower(4, Some(node("node-1")), 8, 3);
+        raft.role = Role::Leader;
+        raft.voters.insert(
+            node("node-2"),
+            Progress {
+                next_index: 6,
+                match_index: 5,
+            },
+        );
+
+        let effect = raft
+            .handle(Event::HeartbeatResponse(ReceivedHeartbeatResponse {
+                from: node("node-2"),
+                response: AppendEntriesResponse {
+                    term: 4,
+                    success: true,
+                    last_log_index: 8,
+                    last_log_term: 3,
+                },
+            }))
+            .unwrap();
+
+        let progress = raft.voters.get(&node("node-2")).unwrap();
+        assert!(effect.is_none());
+        assert_eq!(progress.match_index, 8);
+        assert_eq!(progress.next_index, 9);
+    }
+
+    #[test]
+    fn rejected_heartbeat_response_rewinds_peer_next_index() {
+        let mut raft = follower(4, Some(node("node-1")), 8, 3);
+        raft.role = Role::Leader;
+        raft.voters.insert(
+            node("node-2"),
+            Progress {
+                next_index: 9,
+                match_index: 0,
+            },
+        );
+
+        let effect = raft
+            .handle(Event::HeartbeatResponse(ReceivedHeartbeatResponse {
+                from: node("node-2"),
+                response: AppendEntriesResponse {
+                    term: 4,
+                    success: false,
+                    last_log_index: 5,
+                    last_log_term: 2,
+                },
+            }))
+            .unwrap();
+
+        let progress = raft.voters.get(&node("node-2")).unwrap();
+        assert!(effect.is_none());
+        assert_eq!(progress.match_index, 0);
+        assert_eq!(progress.next_index, 6);
+    }
+
+    #[test]
+    fn heartbeat_response_with_higher_term_makes_leader_step_down() {
+        let mut raft = follower(4, Some(node("node-1")), 8, 3);
+        raft.role = Role::Leader;
+        raft.current_votes = 2;
+
+        let effect = raft
+            .handle(Event::HeartbeatResponse(ReceivedHeartbeatResponse {
+                from: node("node-2"),
+                response: AppendEntriesResponse {
+                    term: 5,
+                    success: false,
+                    last_log_index: 8,
+                    last_log_term: 3,
+                },
+            }))
+            .unwrap();
+
+        assert!(effect.is_none());
+        assert_eq!(raft.current_term, 5);
+        assert_eq!(raft.role, Role::Follower);
+        assert_eq!(raft.voted_for, None);
+        assert_eq!(raft.leader_id, None);
+        assert_eq!(raft.current_votes, 0);
     }
 }
