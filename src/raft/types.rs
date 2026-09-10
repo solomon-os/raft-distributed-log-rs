@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use serf::net::Node;
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -15,8 +17,10 @@ pub enum Role {
 pub enum Event {
     ElectionTimeout,
     HeartbeatTimeout,
+    Heartbeat(HeartbeatRequest),
     RequestVote(VoteRequest),
     AppendEntries(AppendEntriesRequest),
+    AppendEntriesResponse(ReceivedAppendEntriesResponse),
     EntriesPersisted(PersistedEntries),
     EntriesApplied(AppliedEntries),
     VoteResponse(ReceivedVoteResponse),
@@ -40,6 +44,12 @@ pub enum Effect {
     SendHeartbeat {
         peers: Vec<NodeId>,
         request: HeartbeatRequest,
+    },
+    SendHeartbeatResponse {
+        peer: NodeId,
+        response: AppendEntriesResponse,
+        reset_election_timer: bool,
+        apply_through: Option<u64>,
     },
     PersistEntries {
         peer: NodeId,
@@ -124,6 +134,7 @@ pub struct AppendEntriesResponse {
     pub(super) success: bool,
     pub(super) last_log_index: u64,
     pub(super) last_log_term: u64,
+    pub(super) leader_id: Option<NodeId>,
 }
 
 pub struct PersistedEntries {
@@ -152,10 +163,16 @@ pub struct LocalEntry {
     pub(super) term: u64,
 }
 
+#[derive(Debug)]
 pub struct ReplicationTarget {
     pub(super) peer: NodeId,
     pub(super) last_log_index: u64,
     pub(super) last_log_term: u64,
     pub(super) leader_id: NodeId,
     pub(super) leader_commit_index: u64,
+}
+
+pub struct ReceivedAppendEntriesResponse {
+    pub(super) from: NodeId,
+    pub(super) response: AppendEntriesResponse,
 }
