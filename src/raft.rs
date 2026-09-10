@@ -1,18 +1,15 @@
 // Implement the Raft core here, one step at a time.
-use std::{cmp::min, iter::repeat_n};
+use std::cmp::min;
 
 mod types;
-use crate::raft::types::{
-    Error::{NotCandidate, NotLeader},
-    Role::{Follower, Leader},
-};
+use crate::raft::types::{Error::NotCandidate, Role::Leader};
 
 use self::types::*;
 
 impl Raft {
     fn handle(&mut self, ev: Event) -> Result<Option<Effect>> {
         match ev {
-            Event::Write => self.handle_write().map(Some),
+            Event::Write(operation_id) => self.handle_write(operation_id).map(Some),
             Event::LocalEntriesAppended(local_entry) => {
                 self.handle_local_entry_appended(local_entry).map(Some)
             }
@@ -192,9 +189,16 @@ impl Raft {
         })
     }
 
-    fn handle_append_entries(&mut self, append_request: AppendEntriesRequest) -> Result<Effect> {
+    fn handle_append_entries(&mut self, received: ReceivedAppendEntries) -> Result<Effect> {
+        let ReceivedAppendEntries {
+            operation_id,
+            request: append_request,
+            local_prev_log_term,
+        } = received;
+
         if append_request.term < self.current_term {
             return Ok(Effect::RejectAppendEntries {
+                operation_id,
                 peer: append_request.leader_id,
                 response: AppendEntriesResponse {
                     last_log_index: self.last_log_index,
@@ -206,12 +210,14 @@ impl Raft {
             });
         }
 
-        if append_request.prev_log_term == self.last_log_term
-            && append_request.prev_log_index > self.last_log_index
-        {
+        let previous_entry_matches = append_request.prev_log_index == 0
+            || local_prev_log_term == Some(append_request.prev_log_term);
+
+        if append_request.prev_log_index > self.last_log_index || !previous_entry_matches {
             self.current_term = append_request.term;
             self.leader_id = Some(append_request.leader_id.clone());
             return Ok(Effect::RejectAppendEntries {
+                operation_id,
                 peer: append_request.leader_id.clone(),
                 response: AppendEntriesResponse {
                     last_log_index: self.last_log_index,
@@ -230,6 +236,7 @@ impl Raft {
                 self.current_term = append_request.term;
                 self.leader_id = Some(append_request.leader_id.clone());
                 return Ok(Effect::PersistEntries {
+                    operation_id,
                     peer: append_request.leader_id,
                     response: AppendEntriesResponse {
                         last_log_index: append_request.prev_log_index,
@@ -249,6 +256,7 @@ impl Raft {
         self.leader_id = Some(append_request.leader_id.clone());
 
         Ok(Effect::PersistEntries {
+            operation_id,
             peer: append_request.leader_id,
             response: AppendEntriesResponse {
                 last_log_index: self.last_log_index,
@@ -270,6 +278,7 @@ impl Raft {
         if new_commit_index > self.commit_index {
             self.commit_index = new_commit_index;
             return Ok(Some(Effect::ApplyCommitted {
+                operation_id: entries.operation_id,
                 through: self.commit_index,
             }));
         }
@@ -333,7 +342,10 @@ impl Raft {
         leader_progress.match_index = self.last_log_index;
         leader_progress.next_index = self.last_log_index + 1;
 
-        Ok(Effect::SendAppendEntries { targets })
+        Ok(Effect::SendAppendEntries {
+            operation_id: entry.operation_id,
+            targets,
+        })
     }
 
     fn handle_vote_response(
@@ -417,11 +429,12 @@ impl Raft {
         Ok(None)
     }
 
-    fn handle_write(&self) -> Result<Effect> {
+    fn handle_write(&self, operation_id: OperationId) -> Result<Effect> {
         if self.role != Role::Leader {
             return Err(Error::NotLeader(self.leader_id.clone()));
         }
         Ok(Effect::AppendLocal {
+            operation_id,
             term: self.current_term,
             last_log_index: self.last_log_index,
         })
@@ -429,7 +442,11 @@ impl Raft {
 
     fn handle_append_entries_response(
         &mut self,
-        ReceivedAppendEntriesResponse { from, response }: ReceivedAppendEntriesResponse,
+        ReceivedAppendEntriesResponse {
+            operation_id,
+            from,
+            response,
+        }: ReceivedAppendEntriesResponse,
     ) -> Result<Option<Effect>> {
         if self.role != Leader {
             return Err(Error::NotLeader(response.leader_id));
@@ -462,6 +479,7 @@ impl Raft {
 
             if response.last_log_index < self.last_log_index {
                 return Ok(Some(Effect::SendAppendEntries {
+                    operation_id,
                     targets: vec![ReplicationTarget {
                         peer: from,
                         last_log_index: response.last_log_index,
@@ -486,6 +504,7 @@ impl Raft {
             if learner_progress.match_index < self.last_log_index {
                 self.learners.insert(from.clone(), learner_progress);
                 return Ok(Some(Effect::SendAppendEntries {
+                    operation_id,
                     targets: vec![ReplicationTarget {
                         peer: from,
                         last_log_index: response.last_log_index,
@@ -511,6 +530,7 @@ impl Raft {
                     self.voters.insert(from.clone(), peer_progress);
                 }
                 return Ok(Some(Effect::SendAppendEntries {
+                    operation_id,
                     targets: vec![ReplicationTarget {
                         peer: from,
                         last_log_index: response.last_log_index,
@@ -541,6 +561,7 @@ impl Raft {
             if caught_up > self.voters.len() as u64 / 2 {
                 self.commit_index = self.last_log_index;
                 return Ok(Some(Effect::ApplyCommitted {
+                    operation_id,
                     through: self.commit_index,
                 }));
             }
@@ -557,6 +578,22 @@ mod tests {
 
     fn node(id: &str) -> NodeId {
         NodeId(id.to_owned())
+    }
+
+    fn operation(id: u64) -> OperationId {
+        OperationId(id)
+    }
+
+    fn append_entries_event(
+        operation_id: u64,
+        request: AppendEntriesRequest,
+        local_prev_log_term: Option<u64>,
+    ) -> Event {
+        Event::AppendEntries(ReceivedAppendEntries {
+            operation_id: operation(operation_id),
+            request,
+            local_prev_log_term,
+        })
     }
 
     fn progress() -> Progress {
@@ -928,20 +965,30 @@ mod tests {
         let mut raft = follower(4, None, 8, 3);
 
         let effect = raft
-            .handle(Event::AppendEntries(AppendEntriesRequest {
-                term: 3,
-                leader_id: node("node-2"),
-                prev_log_index: 8,
-                prev_log_term: 3,
-                commit_index: 6,
-            }))
+            .handle(append_entries_event(
+                1,
+                AppendEntriesRequest {
+                    term: 3,
+                    leader_id: node("node-2"),
+                    prev_log_index: 8,
+                    prev_log_term: 3,
+                    commit_index: 6,
+                },
+                Some(3),
+            ))
             .unwrap()
             .expect("AppendEntries must produce an effect");
 
-        let Effect::RejectAppendEntries { peer, response } = effect else {
+        let Effect::RejectAppendEntries {
+            operation_id,
+            peer,
+            response,
+        } = effect
+        else {
             panic!("an older leader term must be rejected");
         };
 
+        assert_eq!(operation_id, operation(1));
         assert_eq!(peer, node("node-2"));
         assert_eq!(response.term, 4);
         assert_eq!(response.success, false);
@@ -956,20 +1003,30 @@ mod tests {
         let mut raft = follower(4, None, 8, 3);
 
         let effect = raft
-            .handle(Event::AppendEntries(AppendEntriesRequest {
-                term: 4,
-                leader_id: node("node-2"),
-                prev_log_index: 9,
-                prev_log_term: 3,
-                commit_index: 6,
-            }))
+            .handle(append_entries_event(
+                2,
+                AppendEntriesRequest {
+                    term: 4,
+                    leader_id: node("node-2"),
+                    prev_log_index: 9,
+                    prev_log_term: 3,
+                    commit_index: 6,
+                },
+                None,
+            ))
             .unwrap()
             .expect("AppendEntries must produce an effect");
 
-        let Effect::RejectAppendEntries { peer, response } = effect else {
+        let Effect::RejectAppendEntries {
+            operation_id,
+            peer,
+            response,
+        } = effect
+        else {
             panic!("a missing previous log entry must be rejected");
         };
 
+        assert_eq!(operation_id, operation(2));
         assert_eq!(peer, node("node-2"));
         assert_eq!(response.term, 4);
         assert_eq!(response.success, false);
@@ -978,21 +1035,60 @@ mod tests {
     }
 
     #[test]
+    fn append_entries_rejects_a_mismatched_local_previous_term() {
+        let mut raft = follower(4, None, 8, 3);
+
+        let effect = raft
+            .handle(append_entries_event(
+                21,
+                AppendEntriesRequest {
+                    term: 4,
+                    leader_id: node("node-2"),
+                    prev_log_index: 5,
+                    prev_log_term: 3,
+                    commit_index: 4,
+                },
+                Some(2),
+            ))
+            .unwrap()
+            .expect("AppendEntries must produce an effect");
+
+        let Effect::RejectAppendEntries {
+            operation_id,
+            response,
+            ..
+        } = effect
+        else {
+            panic!("a mismatched previous term must be rejected");
+        };
+
+        assert_eq!(operation_id, operation(21));
+        assert_eq!(response.success, false);
+        assert_eq!(raft.last_log_index, 8);
+        assert_eq!(raft.last_log_term, 3);
+    }
+
+    #[test]
     fn append_entries_accepts_a_matching_log_prefix() {
         let mut raft = follower(4, None, 8, 3);
 
         let effect = raft
-            .handle(Event::AppendEntries(AppendEntriesRequest {
-                term: 4,
-                leader_id: node("node-2"),
-                prev_log_index: 8,
-                prev_log_term: 3,
-                commit_index: 6,
-            }))
+            .handle(append_entries_event(
+                3,
+                AppendEntriesRequest {
+                    term: 4,
+                    leader_id: node("node-2"),
+                    prev_log_index: 8,
+                    prev_log_term: 3,
+                    commit_index: 6,
+                },
+                Some(3),
+            ))
             .unwrap()
             .expect("AppendEntries must produce an effect");
 
         let Effect::PersistEntries {
+            operation_id,
             peer,
             response,
             truncate_after,
@@ -1002,6 +1098,7 @@ mod tests {
             panic!("a matching log prefix must be accepted");
         };
 
+        assert_eq!(operation_id, operation(3));
         assert_eq!(peer, node("node-2"));
         assert_eq!(response.term, 4);
         assert_eq!(response.success, true);
@@ -1016,13 +1113,17 @@ mod tests {
         let mut raft = follower(4, None, 8, 3);
 
         let effect = raft
-            .handle(Event::AppendEntries(AppendEntriesRequest {
-                term: 4,
-                leader_id: node("node-2"),
-                prev_log_index: 8,
-                prev_log_term: 3,
-                commit_index: 12,
-            }))
+            .handle(append_entries_event(
+                4,
+                AppendEntriesRequest {
+                    term: 4,
+                    leader_id: node("node-2"),
+                    prev_log_index: 8,
+                    prev_log_term: 3,
+                    commit_index: 12,
+                },
+                Some(3),
+            ))
             .unwrap()
             .expect("AppendEntries must produce an effect");
 
@@ -1044,13 +1145,17 @@ mod tests {
         raft.role = Role::Candidate;
 
         let effect = raft
-            .handle(Event::AppendEntries(AppendEntriesRequest {
-                term: 5,
-                leader_id: node("node-2"),
-                prev_log_index: 8,
-                prev_log_term: 3,
-                commit_index: 6,
-            }))
+            .handle(append_entries_event(
+                5,
+                AppendEntriesRequest {
+                    term: 5,
+                    leader_id: node("node-2"),
+                    prev_log_index: 8,
+                    prev_log_term: 3,
+                    commit_index: 6,
+                },
+                Some(3),
+            ))
             .unwrap()
             .expect("AppendEntries must produce an effect");
 
@@ -1066,13 +1171,17 @@ mod tests {
         let mut raft = follower(4, None, 8, 3);
 
         let effect = raft
-            .handle(Event::AppendEntries(AppendEntriesRequest {
-                term: 5,
-                leader_id: node("node-2"),
-                prev_log_index: 5,
-                prev_log_term: 2,
-                commit_index: 4,
-            }))
+            .handle(append_entries_event(
+                6,
+                AppendEntriesRequest {
+                    term: 5,
+                    leader_id: node("node-2"),
+                    prev_log_index: 5,
+                    prev_log_term: 2,
+                    commit_index: 4,
+                },
+                Some(2),
+            ))
             .unwrap()
             .expect("accepted AppendEntries must produce an effect");
 
@@ -1098,6 +1207,7 @@ mod tests {
 
         let effect = raft
             .handle(Event::EntriesPersisted(PersistedEntries {
+                operation_id: operation(7),
                 last_log_index: 8,
                 last_log_term: 4,
                 leader_commit_index: 6,
@@ -1110,10 +1220,15 @@ mod tests {
         assert_eq!(raft.commit_index, 6);
         assert_eq!(raft.last_applied, 3);
 
-        let Effect::ApplyCommitted { through } = effect else {
+        let Effect::ApplyCommitted {
+            operation_id,
+            through,
+        } = effect
+        else {
             panic!("persisting committed entries must request application");
         };
 
+        assert_eq!(operation_id, operation(7));
         assert_eq!(through, 6);
     }
 
@@ -1123,7 +1238,10 @@ mod tests {
         raft.last_applied = 3;
 
         let effect = raft
-            .handle(Event::EntriesApplied(AppliedEntries { through: 6 }))
+            .handle(Event::EntriesApplied(AppliedEntries {
+                operation_id: operation(8),
+                through: 6,
+            }))
             .unwrap();
 
         assert!(effect.is_none());
@@ -1136,6 +1254,7 @@ mod tests {
 
         let effect = raft
             .handle(Event::EntriesPersisted(PersistedEntries {
+                operation_id: operation(9),
                 last_log_index: 8,
                 last_log_term: 4,
                 leader_commit_index: 12,
@@ -1145,10 +1264,15 @@ mod tests {
 
         assert_eq!(raft.commit_index, 8);
 
-        let Effect::ApplyCommitted { through } = effect else {
+        let Effect::ApplyCommitted {
+            operation_id,
+            through,
+        } = effect
+        else {
             panic!("persisting committed entries must request application");
         };
 
+        assert_eq!(operation_id, operation(9));
         assert_eq!(through, 8);
     }
 
@@ -1158,11 +1282,12 @@ mod tests {
         raft.role = Role::Leader;
 
         let effect = raft
-            .handle(Event::Write)
+            .handle(Event::Write(operation(10)))
             .unwrap()
             .expect("a leader write must produce an effect");
 
         let Effect::AppendLocal {
+            operation_id,
             term,
             last_log_index,
         } = effect
@@ -1170,6 +1295,7 @@ mod tests {
             panic!("a leader write must append locally first");
         };
 
+        assert_eq!(operation_id, operation(10));
         assert_eq!(term, 4);
         assert_eq!(last_log_index, 8);
         assert_eq!(raft.last_log_index, 8);
@@ -1179,7 +1305,7 @@ mod tests {
     fn write_on_follower_returns_known_leader() {
         let mut raft = follower(4, None, 8, 3);
 
-        let result = raft.handle(Event::Write);
+        let result = raft.handle(Event::Write(operation(11)));
 
         assert!(matches!(
             result,
@@ -1195,6 +1321,7 @@ mod tests {
         raft.role = Role::Leader;
 
         raft.handle(Event::LocalEntriesAppended(LocalEntry {
+            operation_id: operation(12),
             index: 9,
             term: 4,
         }))
@@ -1237,15 +1364,22 @@ mod tests {
 
         let effect = raft
             .handle(Event::LocalEntriesAppended(LocalEntry {
+                operation_id: operation(13),
                 index: 9,
                 term: 4,
             }))
             .unwrap()
             .expect("a persisted local entry must be replicated");
 
-        let Effect::SendAppendEntries { targets } = effect else {
+        let Effect::SendAppendEntries {
+            operation_id,
+            targets,
+        } = effect
+        else {
             panic!("a persisted local entry must produce replication targets");
         };
+
+        assert_eq!(operation_id, operation(13));
 
         let targets: HashMap<_, _> = targets
             .into_iter()
@@ -1277,6 +1411,7 @@ mod tests {
         let mut raft = follower(5, None, 8, 3);
 
         let result = raft.handle(Event::LocalEntriesAppended(LocalEntry {
+            operation_id: operation(14),
             index: 9,
             term: 4,
         }));
@@ -1461,6 +1596,7 @@ mod tests {
         let effect = raft
             .handle(Event::AppendEntriesResponse(
                 ReceivedAppendEntriesResponse {
+                    operation_id: operation(15),
                     from: node("node-2"),
                     response: AppendEntriesResponse {
                         term: 4,
@@ -1474,9 +1610,14 @@ mod tests {
             .unwrap()
             .expect("a follower behind the leader must be retried");
 
-        let Effect::SendAppendEntries { targets } = effect else {
+        let Effect::SendAppendEntries {
+            operation_id,
+            targets,
+        } = effect
+        else {
             panic!("a rejected append must retry replication");
         };
+        assert_eq!(operation_id, operation(15));
         let [target] = targets.as_slice() else {
             panic!("only the rejecting follower should be retried");
         };
@@ -1499,6 +1640,7 @@ mod tests {
         let effect = raft
             .handle(Event::AppendEntriesResponse(
                 ReceivedAppendEntriesResponse {
+                    operation_id: operation(16),
                     from: learner.clone(),
                     response: AppendEntriesResponse {
                         term: 4,
@@ -1532,6 +1674,7 @@ mod tests {
         let effect = raft
             .handle(Event::AppendEntriesResponse(
                 ReceivedAppendEntriesResponse {
+                    operation_id: operation(17),
                     from: learner.clone(),
                     response: AppendEntriesResponse {
                         term: 4,
@@ -1563,6 +1706,7 @@ mod tests {
 
         raft.handle(Event::AppendEntriesResponse(
             ReceivedAppendEntriesResponse {
+                operation_id: operation(18),
                 from: voter.clone(),
                 response: AppendEntriesResponse {
                     term: 4,
@@ -1600,6 +1744,7 @@ mod tests {
         let effect = raft
             .handle(Event::AppendEntriesResponse(
                 ReceivedAppendEntriesResponse {
+                    operation_id: operation(19),
                     from: node("node-2"),
                     response: AppendEntriesResponse {
                         term: 4,
@@ -1614,9 +1759,14 @@ mod tests {
             .expect("leader plus one follower is a majority of three voters");
 
         assert_eq!(raft.commit_index, 10);
-        let Effect::ApplyCommitted { through } = effect else {
+        let Effect::ApplyCommitted {
+            operation_id,
+            through,
+        } = effect
+        else {
             panic!("a majority-replicated entry must be applied");
         };
+        assert_eq!(operation_id, operation(19));
         assert_eq!(through, 10);
     }
 
@@ -1629,6 +1779,7 @@ mod tests {
 
         let result = raft.handle(Event::AppendEntriesResponse(
             ReceivedAppendEntriesResponse {
+                operation_id: operation(20),
                 from: node("node-2"),
                 response: AppendEntriesResponse {
                     term: 5,

@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
-use serf::net::Node;
-
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct OperationId(pub(super) u64);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct NodeId(pub(super) String);
@@ -19,14 +20,14 @@ pub enum Event {
     HeartbeatTimeout,
     Heartbeat(HeartbeatRequest),
     RequestVote(VoteRequest),
-    AppendEntries(AppendEntriesRequest),
+    AppendEntries(ReceivedAppendEntries),
     AppendEntriesResponse(ReceivedAppendEntriesResponse),
     EntriesPersisted(PersistedEntries),
     EntriesApplied(AppliedEntries),
     VoteResponse(ReceivedVoteResponse),
     HeartbeatResponse(ReceivedHeartbeatResponse),
     LocalEntriesAppended(LocalEntry),
-    Write,
+    Write(OperationId),
 }
 
 pub enum Effect {
@@ -35,6 +36,7 @@ pub enum Effect {
         request: VoteRequest,
     },
     SendAppendEntries {
+        operation_id: OperationId,
         targets: Vec<ReplicationTarget>,
     },
     SendRequestVoteResponse {
@@ -52,19 +54,23 @@ pub enum Effect {
         apply_through: Option<u64>,
     },
     PersistEntries {
+        operation_id: OperationId,
         peer: NodeId,
         response: AppendEntriesResponse,
         truncate_after: Option<u64>,
         leader_commit_index: u64,
     },
     ApplyCommitted {
+        operation_id: OperationId,
         through: u64,
     },
     RejectAppendEntries {
+        operation_id: OperationId,
         peer: NodeId,
         response: AppendEntriesResponse,
     },
     AppendLocal {
+        operation_id: OperationId,
         term: u64,
         last_log_index: u64,
     },
@@ -138,12 +144,14 @@ pub struct AppendEntriesResponse {
 }
 
 pub struct PersistedEntries {
+    pub(super) operation_id: OperationId,
     pub(super) last_log_index: u64,
     pub(super) last_log_term: u64,
     pub(super) leader_commit_index: u64,
 }
 
 pub struct AppliedEntries {
+    pub(super) operation_id: OperationId,
     pub(super) through: u64,
 }
 
@@ -159,6 +167,7 @@ pub struct ReceivedHeartbeatResponse {
 }
 
 pub struct LocalEntry {
+    pub(super) operation_id: OperationId,
     pub(super) index: u64,
     pub(super) term: u64,
 }
@@ -173,6 +182,13 @@ pub struct ReplicationTarget {
 }
 
 pub struct ReceivedAppendEntriesResponse {
+    pub(super) operation_id: OperationId,
     pub(super) from: NodeId,
     pub(super) response: AppendEntriesResponse,
+}
+
+pub struct ReceivedAppendEntries {
+    pub(super) operation_id: OperationId,
+    pub(super) request: AppendEntriesRequest,
+    pub(super) local_prev_log_term: Option<u64>,
 }
