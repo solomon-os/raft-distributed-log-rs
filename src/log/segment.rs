@@ -108,6 +108,10 @@ impl Segment {
         self.base_offset
     }
 
+    pub fn next_offset(&self) -> u64 {
+        return self.next_offset;
+    }
+
     pub fn close(&mut self) -> io::Result<()> {
         self.store.close()?;
         self.index.close()?;
