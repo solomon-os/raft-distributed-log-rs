@@ -2,7 +2,10 @@
 use std::cmp::min;
 
 mod types;
-use crate::raft::types::{Error::NotCandidate, Role::Leader};
+use crate::raft::{
+    self,
+    types::{Error::NotCandidate, Role::Leader},
+};
 
 use self::types::*;
 
