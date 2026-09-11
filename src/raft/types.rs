@@ -76,6 +76,8 @@ pub enum Effect {
     },
 }
 
+pub enum RuntimeMessage {}
+
 #[derive(Debug)]
 pub struct Raft {
     pub(super) id: NodeId,

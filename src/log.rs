@@ -145,6 +145,10 @@ impl Log {
     pub fn next_offset(&self) -> u64 {
         return self.segments[self.active_index].next_offset();
     }
+
+    pub fn dir(&self) -> PathBuf {
+        self.dir.clone()
+    }
 }
 
 #[cfg(test)]
