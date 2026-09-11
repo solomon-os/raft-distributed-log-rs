@@ -18,6 +18,7 @@ type SerfHandle = TokioTcpSerf<NodeId, TokioHostAddrResolver, ConsulDelegate>;
 struct Config {
     pub peer_addresses: Vec<String>,
     pub addr: String,
+    pub advertise_addr: String,
     pub node_id: String,
     pub rpc_addr: String,
 }
@@ -41,9 +42,11 @@ impl Membership {
         // Numeric, so the resolver parses it as an IP literal and never
         // touches DNS for the local bind address.
         let bind_addr: HostAddr = format!("[::]:{}", cfg.addr).parse().unwrap();
+        let advertise_addr: SocketAddr = cfg.advertise_addr.parse().unwrap();
         let node_id: NodeId = cfg.node_id.parse().unwrap();
         let transport = NetTransportOptions::<NodeId, TokioHostAddrResolver, _>::new(node_id)
-            .with_bind_addresses([bind_addr].into_iter().collect());
+            .with_bind_addresses([bind_addr].into_iter().collect())
+            .with_advertise_address(advertise_addr);
 
         let opts = Options::new()
             .with_memberlist_options(MemberlistOptions::local())
@@ -157,6 +160,7 @@ mod test {
         Config {
             peer_addresses: peers,
             addr: port.to_string(),
+            advertise_addr: format!("[::1]:{port}"),
             node_id: node_id.to_string(),
             rpc_addr: format!("[::1]:{port}"),
         }

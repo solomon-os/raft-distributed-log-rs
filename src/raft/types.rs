@@ -192,3 +192,7 @@ pub struct ReceivedAppendEntries {
     pub(super) request: AppendEntriesRequest,
     pub(super) local_prev_log_term: Option<u64>,
 }
+pub struct State {
+    pub current_term: u64,
+    pub voted_for: Option<NodeId>,
+}
