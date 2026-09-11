@@ -2,8 +2,8 @@ use crate::raft::types::RuntimeMessage;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+#[derive(Clone, Debug)]
 pub struct Handle {
-    pub(super) rx: mpsc::Receiver<RuntimeMessage>,
     pub tx: mpsc::Sender<RuntimeMessage>,
     pub shutdown: CancellationToken,
 }

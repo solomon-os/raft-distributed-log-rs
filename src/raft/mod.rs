@@ -1,5 +1,10 @@
 mod core;
 mod handle;
+pub use handle::Handle;
 mod runtime;
+pub use runtime::Runtime;
 mod storage;
 mod types;
+pub use types::Error;
+pub use types::NodeId;
+pub use types::RuntimeMessage;

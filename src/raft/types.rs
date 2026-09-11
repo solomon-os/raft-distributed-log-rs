@@ -1,4 +1,8 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt::Display};
+
+use object_pool::ReusableOwned;
+use serf::net::futures::sink::Send;
+use tokio::sync::oneshot::Sender;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -7,6 +11,12 @@ pub struct OperationId(pub(super) u64);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct NodeId(pub(super) String);
+
+impl Display for NodeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Role {
@@ -76,7 +86,12 @@ pub enum Effect {
     },
 }
 
-pub enum RuntimeMessage {}
+pub enum RuntimeMessage {
+    Write {
+        data: ReusableOwned<Vec<u8>>,
+        reply: Sender<Result<()>>,
+    },
+}
 
 #[derive(Debug)]
 pub struct Raft {

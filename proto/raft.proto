@@ -1,0 +1,12 @@
+syntax = "proto3";
+package raft;
+
+service RaftService {
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+  rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
+}
+
+message AppendEntriesRequest {}
+message AppendEntriesResponse {}
+message RequestVoteRequest {}
+message RequestVoteResponse {}

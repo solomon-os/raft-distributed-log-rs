@@ -47,7 +47,9 @@ impl Runtime {
     }
 
     async fn handle_message(&self, message: RuntimeMessage) {
-        match message {}
+        match message {
+            RuntimeMessage::Write { data, reply } => todo!(),
+        }
     }
 
     async fn run(mut self, shutdown: CancellationToken, mut rx: Receiver<RuntimeMessage>) {

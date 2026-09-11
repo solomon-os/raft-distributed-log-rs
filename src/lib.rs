@@ -1,3 +1,4 @@
+mod grpc;
 mod log;
 mod membership;
 mod raft;

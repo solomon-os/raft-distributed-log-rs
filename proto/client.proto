@@ -1,0 +1,15 @@
+syntax = "proto3";
+package client;
+
+service ClientService {
+  rpc Write(WriteRequest) returns (WriteResponse);
+}
+
+message WriteRequest {
+  string key = 1;
+  string value = 2;
+}
+
+message WriteResponse {
+  bool ok = 1;
+}
