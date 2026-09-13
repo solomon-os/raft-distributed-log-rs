@@ -18,14 +18,14 @@ impl Raft {
             Event::ElectionTimeout => self.handle_election_timeout().map(Some),
             Event::HeartbeatTimeout => self.handle_heartbeat_timeout().map(Some),
             Event::AppendEntriesResponse(response) => self.handle_append_entries_response(response),
-            Event::EntriesRejected => todo!(),
         }
     }
 
     fn handle_election_timeout(&mut self) -> Result<Effect> {
         self.current_term += 1;
-        self.current_votes = 1;
         self.voted_for = Some(self.id.clone());
+        self.granted_votes.clear();
+        self.granted_votes.insert(self.id.clone());
 
         let peers = self
             .voters
@@ -35,8 +35,8 @@ impl Raft {
             .collect();
 
         self.role = Role::Candidate;
-        self.voted_for = Some(self.id.clone()); // vote for my self;
         Ok(Effect::SendRequestVotes {
+            hard_state: self.hard_state(),
             peers,
             request: VoteRequest {
                 term: self.current_term,
@@ -48,53 +48,38 @@ impl Raft {
     }
 
     fn handle_request_vote(&mut self, vote_request: VoteRequest) -> Result<Effect> {
-        if vote_request.term < self.current_term || vote_request.last_log_term < self.last_log_term
-        {
-            return Ok(Effect::SendRequestVoteResponse {
-                peer: vote_request.candidate_id,
-                response: VoteResponse {
-                    term: self.current_term,
-                    vote_granted: false,
-                },
-            });
+        let mut hard_state_changed = false;
+
+        if vote_request.term > self.current_term {
+            self.current_term = vote_request.term;
+            self.voted_for = None;
+            self.role = Role::Follower;
+            self.leader_id = None;
+            self.granted_votes.clear();
+            hard_state_changed = true;
         }
 
-        if vote_request.last_log_term == self.last_log_term
-            && (vote_request.last_log_index < self.last_log_index)
-        {
-            return Ok(Effect::SendRequestVoteResponse {
-                peer: vote_request.candidate_id,
-                response: VoteResponse {
-                    term: self.current_term,
-                    vote_granted: false,
-                },
-            });
-        }
+        let candidate_log_is_up_to_date = vote_request.last_log_term > self.last_log_term
+            || (vote_request.last_log_term == self.last_log_term
+                && vote_request.last_log_index >= self.last_log_index);
 
-        if vote_request.term == self.current_term
-            && self
-                .voted_for
-                .as_ref()
-                .is_some_and(|node| *node != vote_request.candidate_id)
-        {
-            return Ok(Effect::SendRequestVoteResponse {
-                peer: vote_request.candidate_id,
-                response: VoteResponse {
-                    term: self.current_term,
-                    vote_granted: false,
-                },
-            });
-        }
+        let can_vote =
+            self.voted_for.is_none() || self.voted_for.as_ref() == Some(&vote_request.candidate_id);
 
-        self.voted_for = Some(vote_request.candidate_id.clone());
-        self.role = Role::Follower;
-        self.current_term = vote_request.term;
+        let vote_granted =
+            vote_request.term == self.current_term && candidate_log_is_up_to_date && can_vote;
+
+        if vote_granted && self.voted_for.as_ref() != Some(&vote_request.candidate_id) {
+            self.voted_for = Some(vote_request.candidate_id.clone());
+            hard_state_changed = true;
+        }
 
         Ok(Effect::SendRequestVoteResponse {
+            hard_state: hard_state_changed.then(|| self.hard_state()),
             peer: vote_request.candidate_id,
             response: VoteResponse {
                 term: self.current_term,
-                vote_granted: true,
+                vote_granted,
             },
         })
     }
@@ -142,7 +127,7 @@ impl Raft {
         }
 
         self.role = Role::Follower;
-        self.current_votes = 0;
+        self.granted_votes.clear();
         self.leader_id = Some(request.leader_id.clone());
 
         let log_matches =
@@ -284,25 +269,11 @@ impl Raft {
     fn handle_entries_applied(&mut self, entries: AppliedEntries) -> Result<Option<Effect>> {
         self.last_applied = entries.through;
         if self.role == Role::Leader {
-            return Ok(Some(Effect::SendHeartbeat {
-                peers: self
-                    .voters
-                    .keys()
-                    .filter(|node_id| *node_id != &self.id)
-                    .cloned()
-                    .collect(),
-                request: HeartbeatRequest {
-                    term: self.current_term,
-                    leader_id: self.id.clone(),
-                    log_index: self.last_log_index,
-                    log_term: self.last_log_term,
-                    leader_commit_index: self.commit_index,
-                },
+            return Ok(Some(Effect::CompleteOperation {
+                operation_id: entries.operation_id,
             }));
         }
-        Ok(Some(Effect::CompleteOperation {
-            operation_id: entries.operation_id,
-        }))
+        Ok(None)
     }
 
     fn handle_local_entry_appended(&mut self, entry: LocalEntry) -> Result<Effect> {
@@ -341,16 +312,16 @@ impl Raft {
         leader_progress.next_index = self.last_log_index + 1;
 
         if targets.is_empty() {
+            self.commit_index = self.last_log_index;
             return Ok(Effect::ApplyCommitted {
                 operation_id: entry.operation_id,
-                through: self.last_log_index,
+                through: self.commit_index,
             });
         }
 
-        self.commit_index = self.last_log_index;
-        Ok(Effect::ApplyCommitted {
+        Ok(Effect::SendAppendEntries {
             operation_id: entry.operation_id,
-            through: self.commit_index,
+            targets,
         })
     }
 
@@ -358,33 +329,44 @@ impl Raft {
         &mut self,
         vote_response: ReceivedVoteResponse,
     ) -> Result<Option<Effect>> {
+        if vote_response.response.term > self.current_term {
+            self.current_term = vote_response.response.term;
+            self.role = Role::Follower;
+            self.voted_for = None;
+            self.leader_id = None;
+            self.granted_votes.clear();
+            return Ok(None);
+        }
+
         if self.role != Role::Candidate {
             return Err(NotCandidate);
         }
 
-        if vote_response.response.vote_granted {
-            self.current_votes += 1;
-            if self.role != Role::Leader {
-                if self.current_votes > self.voters.len() as u64 / 2 {
-                    // make leader and return heartbeat;
-                    self.role = Role::Leader;
-                    return Ok(Some(Effect::SendHeartbeat {
-                        peers: self
-                            .voters
-                            .keys()
-                            .filter(|node_id| *node_id != &self.id)
-                            .cloned()
-                            .collect(),
-                        request: HeartbeatRequest {
-                            term: self.current_term,
-                            leader_id: self.id.clone(),
-                            log_index: self.last_log_index,
-                            log_term: self.last_log_term,
-                            leader_commit_index: self.commit_index,
-                        },
-                    }));
-                }
-            }
+        if vote_response.response.term < self.current_term
+            || !self.voters.contains_key(&vote_response.from)
+            || !vote_response.response.vote_granted
+            || !self.granted_votes.insert(vote_response.from)
+        {
+            return Ok(None);
+        }
+
+        if self.granted_votes.len() > self.voters.len() / 2 {
+            self.role = Role::Leader;
+            return Ok(Some(Effect::SendHeartbeat {
+                peers: self
+                    .voters
+                    .keys()
+                    .filter(|node_id| *node_id != &self.id)
+                    .cloned()
+                    .collect(),
+                request: HeartbeatRequest {
+                    term: self.current_term,
+                    leader_id: self.id.clone(),
+                    log_index: self.last_log_index,
+                    log_term: self.last_log_term,
+                    leader_commit_index: self.commit_index,
+                },
+            }));
         }
 
         Ok(None)
@@ -399,7 +381,7 @@ impl Raft {
             self.role = Role::Follower;
             self.voted_for = None;
             self.leader_id = received.response.leader_id;
-            self.current_votes = 0;
+            self.granted_votes.clear();
             return Ok(None);
         }
 
@@ -463,21 +445,12 @@ impl Raft {
             self.leader_id = response.leader_id.clone();
             self.role = Role::Follower;
             self.voted_for = None;
+            self.granted_votes.clear();
             return Err(Error::NotLeader(response.leader_id));
         }
 
         // if it's rejected.
         if !response.success {
-            // what might be wrong.
-            if response.term > self.current_term && response.leader_id != Some(self.id.clone()) {
-                self.current_term = response.term;
-                self.role = Role::Follower;
-                self.voted_for = None;
-                self.leader_id = self.leader_id.clone();
-                self.current_votes = 0;
-                return Err(Error::NotLeader(response.leader_id.clone()));
-            }
-
             assert!(
                 !(response.last_log_index > self.last_log_index),
                 "follower last log index cannot be greater than leader's index"
@@ -502,13 +475,11 @@ impl Raft {
             "follower's last log index cannot be greater than leader's index"
         );
 
-        // is learner
-        if let Some(mut learner_progress) = self.learners.remove(&from) {
+        if let Some(learner_progress) = self.learners.get_mut(&from) {
             learner_progress.match_index = response.last_log_index;
             learner_progress.next_index = response.last_log_index + 1;
 
             if learner_progress.match_index < self.last_log_index {
-                self.learners.insert(from.clone(), learner_progress);
                 return Ok(Some(Effect::SendAppendEntries {
                     operation_id,
                     targets: vec![ReplicationTarget {
@@ -520,21 +491,14 @@ impl Raft {
                     }],
                 }));
             }
-            // promote to voter;
-            self.voters.insert(from, learner_progress);
             return Ok(None);
         }
 
-        if let Some(mut peer_progress) = self.voters.remove(&from) {
+        if let Some(peer_progress) = self.voters.get_mut(&from) {
             peer_progress.match_index = response.last_log_index;
             peer_progress.next_index = response.last_log_index + 1;
 
             if peer_progress.match_index < self.last_log_index {
-                if self.last_log_index - peer_progress.match_index >= 10 {
-                    self.learners.insert(from.clone(), peer_progress);
-                } else {
-                    self.voters.insert(from.clone(), peer_progress);
-                }
                 return Ok(Some(Effect::SendAppendEntries {
                     operation_id,
                     targets: vec![ReplicationTarget {
@@ -547,24 +511,13 @@ impl Raft {
                 }));
             }
 
-            // check if majority are up
-            let mut caught_up: u64 = 1;
+            let caught_up = self
+                .voters
+                .values()
+                .filter(|progress| progress.match_index >= self.last_log_index)
+                .count();
 
-            if peer_progress.match_index == self.last_log_index {
-                caught_up += 1;
-            }
-
-            for (node_id, voter_progress) in self.voters.iter() {
-                if *node_id == self.id {
-                    continue;
-                }
-
-                if voter_progress.match_index == self.last_log_index {
-                    caught_up += 1;
-                }
-            }
-
-            if caught_up > self.voters.len() as u64 / 2 {
+            if caught_up > self.voters.len() / 2 && self.commit_index < self.last_log_index {
                 self.commit_index = self.last_log_index;
                 return Ok(Some(Effect::ApplyCommitted {
                     operation_id,
@@ -575,8 +528,11 @@ impl Raft {
         Ok(None)
     }
 
-    fn handle_entries_rejected(&self, operation_id: OperationId) -> Result<Effect> {
-        Ok(Effect::CompleteOperation { operation_id })
+    fn hard_state(&self) -> State {
+        State {
+            current_term: self.current_term,
+            voted_for: self.voted_for.clone(),
+        }
     }
 }
 
@@ -637,7 +593,7 @@ mod tests {
             last_log_index,
             last_log_term,
             leader_id: Some(node("old-leader")),
-            current_votes: 0,
+            granted_votes: HashSet::new(),
         }
     }
 
@@ -659,7 +615,7 @@ mod tests {
             .expect("RequestVote must produce an effect");
 
         match effect {
-            Effect::SendRequestVoteResponse { peer, response } => {
+            Effect::SendRequestVoteResponse { peer, response, .. } => {
                 (peer, response.term, response.vote_granted)
             }
             Effect::SendRequestVotes { .. } => panic!("RequestVote must produce a response"),
@@ -686,7 +642,7 @@ mod tests {
             last_log_index: 8,
             last_log_term: 2,
             leader_id: Some(node("old-leader")),
-            current_votes: 0,
+            granted_votes: HashSet::new(),
         };
 
         let effect = raft
@@ -698,7 +654,12 @@ mod tests {
         assert_eq!(raft.current_term, 3);
         assert_eq!(raft.voted_for, Some(local_node.clone()));
 
-        let Effect::SendRequestVotes { peers, request } = effect else {
+        let Effect::SendRequestVotes {
+            hard_state,
+            peers,
+            request,
+        } = effect
+        else {
             panic!("ElectionTimeout must produce vote requests");
         };
 
@@ -706,6 +667,8 @@ mod tests {
         assert_eq!(request.candidate_id, local_node);
         assert_eq!(request.last_log_index, 8);
         assert_eq!(request.last_log_term, 2);
+        assert_eq!(hard_state.current_term, 3);
+        assert_eq!(hard_state.voted_for, Some(local_node.clone()));
 
         let requested_votes: HashSet<NodeId> = peers.into_iter().collect();
 
@@ -733,7 +696,7 @@ mod tests {
             last_log_index: 8,
             last_log_term: 2,
             leader_id: Some(node("old-leader")),
-            current_votes: 0,
+            granted_votes: HashSet::new(),
         };
 
         let effect = raft
@@ -808,6 +771,45 @@ mod tests {
     }
 
     #[test]
+    fn higher_term_vote_request_is_adopted_even_when_candidate_log_is_stale() {
+        let local_node = node("node-1");
+        let mut raft = follower(4, Some(local_node), 8, 3);
+        raft.role = Role::Candidate;
+
+        let effect = raft
+            .handle(Event::RequestVote(VoteRequest {
+                term: 5,
+                candidate_id: node("node-2"),
+                last_log_index: 100,
+                last_log_term: 2,
+            }))
+            .unwrap()
+            .expect("RequestVote must produce a response");
+
+        let Effect::SendRequestVoteResponse {
+            hard_state,
+            response,
+            ..
+        } = effect
+        else {
+            panic!("RequestVote must produce a vote response");
+        };
+
+        assert!(!response.vote_granted);
+        assert_eq!(response.term, 5);
+        assert_eq!(raft.current_term, 5);
+        assert_eq!(raft.voted_for, None);
+        assert_eq!(raft.role, Role::Follower);
+        assert_eq!(
+            hard_state,
+            Some(State {
+                current_term: 5,
+                voted_for: None,
+            })
+        );
+    }
+
+    #[test]
     fn request_vote_grants_a_candidate_with_an_up_to_date_log() {
         let mut newer_term = follower(4, None, 8, 3);
         let mut same_position = follower(4, None, 8, 3);
@@ -857,7 +859,7 @@ mod tests {
     fn valid_heartbeat_request_makes_candidate_step_down() {
         let mut raft = follower(4, Some(node("node-1")), 8, 3);
         raft.role = Role::Candidate;
-        raft.current_votes = 2;
+        raft.granted_votes = HashSet::from([node("node-1"), node("node-3")]);
 
         let effect = raft
             .handle(Event::Heartbeat(HeartbeatRequest {
@@ -883,7 +885,7 @@ mod tests {
         assert_eq!(reset_election_timer, true);
         assert_eq!(raft.role, Role::Follower);
         assert_eq!(raft.leader_id, Some(node("node-2")));
-        assert_eq!(raft.current_votes, 0);
+        assert!(raft.granted_votes.is_empty());
     }
 
     #[test]
@@ -1259,6 +1261,26 @@ mod tests {
     }
 
     #[test]
+    fn leader_completes_operation_after_committed_entries_are_applied() {
+        let mut raft = follower(4, Some(node("node-1")), 5, 2);
+        raft.role = Role::Leader;
+
+        let effect = raft
+            .handle(Event::EntriesApplied(AppliedEntries {
+                operation_id: operation(80),
+                through: 5,
+            }))
+            .unwrap()
+            .expect("the applied leader operation must complete");
+
+        assert_eq!(raft.last_applied, 5);
+        let Effect::CompleteOperation { operation_id } = effect else {
+            panic!("applying a leader operation must complete its client request");
+        };
+        assert_eq!(operation_id, operation(80));
+    }
+
+    #[test]
     fn entries_persisted_never_commits_beyond_the_local_log() {
         let mut raft = follower(4, None, 5, 2);
 
@@ -1390,6 +1412,7 @@ mod tests {
         };
 
         assert_eq!(operation_id, operation(13));
+        assert_eq!(raft.commit_index, 6);
 
         let targets: HashMap<_, _> = targets
             .into_iter()
@@ -1439,7 +1462,7 @@ mod tests {
         let local_node = node("node-1");
         let mut raft = follower(4, Some(local_node.clone()), 8, 3);
         raft.role = Role::Candidate;
-        raft.current_votes = 1;
+        raft.granted_votes = HashSet::from([local_node.clone()]);
 
         let effect = raft
             .handle(Event::VoteResponse(ReceivedVoteResponse {
@@ -1451,7 +1474,7 @@ mod tests {
             }))
             .unwrap();
 
-        assert_eq!(raft.current_votes, 2);
+        assert_eq!(raft.granted_votes.len(), 2);
         assert_eq!(raft.role, Role::Leader);
 
         let effect = effect.expect("a newly elected leader must send an initial heartbeat");
@@ -1473,7 +1496,7 @@ mod tests {
         let local_node = node("node-1");
         let mut raft = follower(4, Some(local_node), 8, 3);
         raft.role = Role::Candidate;
-        raft.current_votes = 1;
+        raft.granted_votes = HashSet::from([node("node-1")]);
 
         let effect = raft
             .handle(Event::VoteResponse(ReceivedVoteResponse {
@@ -1486,8 +1509,81 @@ mod tests {
             .unwrap();
 
         assert!(effect.is_none());
-        assert_eq!(raft.current_votes, 1);
+        assert_eq!(raft.granted_votes.len(), 1);
         assert_eq!(raft.role, Role::Candidate);
+    }
+
+    #[test]
+    fn duplicate_granted_vote_is_counted_only_once() {
+        let local_node = node("node-1");
+        let mut raft = follower(4, Some(local_node.clone()), 8, 3);
+        raft.voters.insert(node("node-4"), progress());
+        raft.voters.insert(node("node-5"), progress());
+        raft.role = Role::Candidate;
+        raft.granted_votes = HashSet::from([local_node]);
+
+        for _ in 0..2 {
+            let effect = raft
+                .handle(Event::VoteResponse(ReceivedVoteResponse {
+                    from: node("node-2"),
+                    response: VoteResponse {
+                        term: 4,
+                        vote_granted: true,
+                    },
+                }))
+                .unwrap();
+            assert!(effect.is_none());
+        }
+
+        assert_eq!(raft.granted_votes.len(), 2);
+        assert_eq!(raft.role, Role::Candidate);
+    }
+
+    #[test]
+    fn stale_vote_response_is_ignored() {
+        let local_node = node("node-1");
+        let mut raft = follower(5, Some(local_node.clone()), 8, 3);
+        raft.role = Role::Candidate;
+        raft.granted_votes = HashSet::from([local_node]);
+
+        let effect = raft
+            .handle(Event::VoteResponse(ReceivedVoteResponse {
+                from: node("node-2"),
+                response: VoteResponse {
+                    term: 4,
+                    vote_granted: true,
+                },
+            }))
+            .unwrap();
+
+        assert!(effect.is_none());
+        assert_eq!(raft.granted_votes.len(), 1);
+        assert_eq!(raft.role, Role::Candidate);
+        assert_eq!(raft.current_term, 5);
+    }
+
+    #[test]
+    fn higher_term_vote_response_makes_candidate_step_down() {
+        let local_node = node("node-1");
+        let mut raft = follower(4, Some(local_node.clone()), 8, 3);
+        raft.role = Role::Candidate;
+        raft.granted_votes = HashSet::from([local_node]);
+
+        let effect = raft
+            .handle(Event::VoteResponse(ReceivedVoteResponse {
+                from: node("node-2"),
+                response: VoteResponse {
+                    term: 5,
+                    vote_granted: false,
+                },
+            }))
+            .unwrap();
+
+        assert!(effect.is_none());
+        assert_eq!(raft.current_term, 5);
+        assert_eq!(raft.role, Role::Follower);
+        assert_eq!(raft.voted_for, None);
+        assert!(raft.granted_votes.is_empty());
     }
 
     #[test]
@@ -1503,7 +1599,7 @@ mod tests {
         }));
 
         assert!(matches!(result, Err(Error::NotCandidate)));
-        assert_eq!(raft.current_votes, 0);
+        assert!(raft.granted_votes.is_empty());
         assert_eq!(raft.role, Role::Follower);
     }
 
@@ -1573,7 +1669,7 @@ mod tests {
     fn heartbeat_response_with_higher_term_makes_leader_step_down() {
         let mut raft = follower(4, Some(node("node-1")), 8, 3);
         raft.role = Role::Leader;
-        raft.current_votes = 2;
+        raft.granted_votes = HashSet::from([node("node-1"), node("node-3")]);
 
         let effect = raft
             .handle(Event::HeartbeatResponse(ReceivedHeartbeatResponse {
@@ -1593,7 +1689,7 @@ mod tests {
         assert_eq!(raft.role, Role::Follower);
         assert_eq!(raft.voted_for, None);
         assert_eq!(raft.leader_id, Some(node("node-2")));
-        assert_eq!(raft.current_votes, 0);
+        assert!(raft.granted_votes.is_empty());
     }
 
     #[test]
@@ -1674,7 +1770,7 @@ mod tests {
     }
 
     #[test]
-    fn caught_up_learner_is_promoted_to_voter() {
+    fn caught_up_learner_is_not_promoted_without_a_configuration_change() {
         let local_node = node("node-1");
         let learner = node("node-4");
         let mut raft = follower(4, Some(local_node.clone()), 10, 4);
@@ -1698,13 +1794,13 @@ mod tests {
             .unwrap();
 
         assert!(effect.is_none());
-        assert!(!raft.learners.contains_key(&learner));
-        let voter_progress = raft
-            .voters
+        assert!(!raft.voters.contains_key(&learner));
+        let learner_progress = raft
+            .learners
             .get(&learner)
-            .expect("caught-up learner must become a voter");
-        assert_eq!(voter_progress.match_index, 10);
-        assert_eq!(voter_progress.next_index, 11);
+            .expect("catch-up alone must not change quorum membership");
+        assert_eq!(learner_progress.match_index, 10);
+        assert_eq!(learner_progress.next_index, 11);
     }
 
     #[test]

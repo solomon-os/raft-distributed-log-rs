@@ -1,8 +1,10 @@
 use prost::Message;
-use std::{collections::HashMap, fmt::Display};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Display,
+};
 
 use object_pool::ReusableOwned;
-use serf::net::futures::sink::Send;
 use tokio::sync::oneshot::Sender;
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -33,7 +35,6 @@ pub enum Event {
     RequestVote(VoteRequest),
     AppendEntries(ReceivedAppendEntries),
     AppendEntriesResponse(ReceivedAppendEntriesResponse),
-    EntriesRejected,
     EntriesPersisted(PersistedEntries),
     EntriesApplied(AppliedEntries),
     VoteResponse(ReceivedVoteResponse),
@@ -44,6 +45,7 @@ pub enum Event {
 
 pub enum Effect {
     SendRequestVotes {
+        hard_state: State,
         peers: Vec<NodeId>,
         request: VoteRequest,
     },
@@ -52,6 +54,7 @@ pub enum Effect {
         targets: Vec<ReplicationTarget>,
     },
     SendRequestVoteResponse {
+        hard_state: Option<State>,
         peer: NodeId,
         response: VoteResponse,
     },
@@ -111,7 +114,7 @@ pub struct Raft {
     pub(super) commit_index: u64,
     pub(super) last_log_index: u64,
     pub(super) last_log_term: u64,
-    pub(super) current_votes: u64,
+    pub(super) granted_votes: HashSet<NodeId>,
 }
 
 #[derive(Debug)]
@@ -132,6 +135,14 @@ pub enum Error {
     EntrySerialisationFailed(String),
     #[error("channel is not able to recieve response for entry rejection")]
     RejectingEntryFailed(String),
+    #[error("persisting Raft hard state failed: {0}")]
+    PersistStateFailed(String),
+    #[error("reading a committed log entry failed: {0}")]
+    ReadCommittedEntryFailed(String),
+    #[error("decoding a committed log entry failed: {0}")]
+    EntryDeserialisationFailed(String),
+    #[error("applying a committed log entry failed: {0}")]
+    ApplyCommittedEntryFailed(String),
 }
 
 pub struct VoteRequest {
@@ -220,6 +231,7 @@ pub struct ReceivedAppendEntries {
     pub(super) request: AppendEntriesRequest,
     pub(super) local_prev_log_term: Option<u64>,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct State {
     pub current_term: u64,
     pub voted_for: Option<NodeId>,
@@ -245,4 +257,10 @@ pub enum Operation {
         data: ReusableOwned<Vec<u8>>,
         reply: Sender<Result<AppendEntriesResponse>>,
     },
+}
+
+pub trait FSM {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    fn apply(&mut self, command: &[u8]) -> std::result::Result<(), Self::Error>;
 }

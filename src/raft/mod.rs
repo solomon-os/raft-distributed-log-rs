@@ -6,5 +6,6 @@ pub use runtime::Runtime;
 mod storage;
 mod types;
 pub use types::Error;
+pub use types::FSM;
 pub use types::NodeId;
 pub use types::RuntimeMessage;
