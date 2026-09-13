@@ -1,3 +1,4 @@
+use prost::Message;
 use std::{collections::HashMap, fmt::Display};
 
 use object_pool::ReusableOwned;
@@ -32,6 +33,7 @@ pub enum Event {
     RequestVote(VoteRequest),
     AppendEntries(ReceivedAppendEntries),
     AppendEntriesResponse(ReceivedAppendEntriesResponse),
+    EntriesRejected,
     EntriesPersisted(PersistedEntries),
     EntriesApplied(AppliedEntries),
     VoteResponse(ReceivedVoteResponse),
@@ -84,6 +86,9 @@ pub enum Effect {
         term: u64,
         last_log_index: u64,
     },
+    CompleteOperation {
+        operation_id: OperationId,
+    },
 }
 
 pub enum RuntimeMessage {
@@ -121,6 +126,12 @@ pub enum Error {
     NotLeader(Option<NodeId>),
     #[error("node is not a candidate")]
     NotCandidate,
+    #[error("appending to local storage failed")]
+    AppendFailed,
+    #[error("log entry serialisation failed")]
+    EntrySerialisationFailed(String),
+    #[error("channel is not able to recieve response for entry rejection")]
+    RejectingEntryFailed(String),
 }
 
 pub struct VoteRequest {
@@ -212,4 +223,26 @@ pub struct ReceivedAppendEntries {
 pub struct State {
     pub current_term: u64,
     pub voted_for: Option<NodeId>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct LogEntry {
+    #[prost(uint64, tag = "2")]
+    pub term: u64,
+    #[prost(bytes = "vec", tag = "3")]
+    pub command: Vec<u8>,
+}
+
+pub enum Operation {
+    Write {
+        data: Option<ReusableOwned<Vec<u8>>>,
+        reply: Sender<Result<()>>,
+    },
+    Vote {
+        reply: Sender<Result<VoteResponse>>,
+    },
+    AppendEntries {
+        data: ReusableOwned<Vec<u8>>,
+        reply: Sender<Result<AppendEntriesResponse>>,
+    },
 }

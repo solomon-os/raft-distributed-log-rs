@@ -2,7 +2,7 @@ use crate::raft::types::{Error::NotCandidate, Role::Leader, *};
 use std::cmp::min;
 
 impl Raft {
-    fn handle(&mut self, ev: Event) -> Result<Option<Effect>> {
+    pub fn handle(&mut self, ev: Event) -> Result<Option<Effect>> {
         match ev {
             Event::Write(operation_id) => self.handle_write(operation_id).map(Some),
             Event::LocalEntriesAppended(local_entry) => {
@@ -18,6 +18,7 @@ impl Raft {
             Event::ElectionTimeout => self.handle_election_timeout().map(Some),
             Event::HeartbeatTimeout => self.handle_heartbeat_timeout().map(Some),
             Event::AppendEntriesResponse(response) => self.handle_append_entries_response(response),
+            Event::EntriesRejected => todo!(),
         }
     }
 
@@ -299,7 +300,9 @@ impl Raft {
                 },
             }));
         }
-        Ok(None)
+        Ok(Some(Effect::CompleteOperation {
+            operation_id: entries.operation_id,
+        }))
     }
 
     fn handle_local_entry_appended(&mut self, entry: LocalEntry) -> Result<Effect> {
@@ -307,7 +310,7 @@ impl Raft {
             return Err(Error::NotLeader(self.leader_id.clone()));
         }
 
-        let targets = self
+        let targets: Vec<ReplicationTarget> = self
             .voters
             .iter()
             .chain(self.learners.iter())
@@ -337,9 +340,17 @@ impl Raft {
         leader_progress.match_index = self.last_log_index;
         leader_progress.next_index = self.last_log_index + 1;
 
-        Ok(Effect::SendAppendEntries {
+        if targets.is_empty() {
+            return Ok(Effect::ApplyCommitted {
+                operation_id: entry.operation_id,
+                through: self.last_log_index,
+            });
+        }
+
+        self.commit_index = self.last_log_index;
+        Ok(Effect::ApplyCommitted {
             operation_id: entry.operation_id,
-            targets,
+            through: self.commit_index,
         })
     }
 
@@ -562,6 +573,10 @@ impl Raft {
             }
         }
         Ok(None)
+    }
+
+    fn handle_entries_rejected(&self, operation_id: OperationId) -> Result<Effect> {
+        Ok(Effect::CompleteOperation { operation_id })
     }
 }
 
