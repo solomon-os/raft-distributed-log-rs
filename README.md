@@ -142,37 +142,43 @@ Multi-node execution stops at the transport placeholders and is not claimed as c
 ## Architecture
 
 ~~~text
-                         External world
-                               |
-             +-----------------+-----------------+
-             |                 |                 |
-             v                 v                 v
-           Timers          Raft RPCs        Client RPCs
-             |                 |                 |
-             +-----------------+-----------------+
-                               |
-                               v
-                         Runtime messages
-                               |
-                               v
-                       +---------------+
-                       | Single runtime|
-                       | task / owner  |
-                       +---------------+
-                               |
-                               | Event
-                               v
-                       +---------------+
-                       |   Raft core   |
-                       | deterministic |
-                       +---------------+
-                               |
-                               | Effect
-                               v
-             +-----------------+-----------------+
-             |                 |                 |
-             v                 v                 v
-         Persistence       Transport           FSM
+                              External world
+                                    |
+                  +-----------------+-----------------+
+                  |                 |                 |
+                  v                 v                 v
+                Timers          Raft RPCs        Client RPCs
+                  |                 |                 |
+                  +-----------------+-----------------+
+                                    |
+                                    v
+                              RuntimeMessage
+                                    |
+                                    v
+        +---------------------------------------------------------+
+        |              Single runtime task / owner                |
+        |                                                         |
+        |  handle_message: RuntimeMessage -> initial Event        |
+        |                                    |                    |
+        |                                    v                    |
+        |                         drive loop                      |
+        |                                                         |
+        |       Event    +----------------+    Effect              |
+        |    +---------->|  Raft::handle  |----------+            |
+        |    |           | deterministic  |          |            |
+        |    |           +----------------+          v            |
+        |    |                                  +---------+        |
+        |    +----------- next Event -----------| execute |        |
+        |                                       +---------+        |
+        |                                            |            |
+        |                    None: stop cycle <-------+            |
+        |                    Err: fail operation                   |
+        +--------------------------------------------+------------+
+                                                     |
+                                   +-----------------+-----------------+
+                                   |                 |                 |
+                                   v                 v                 v
+                              Persistence        Transport            FSM
 ~~~
 
 This design avoids sharing Raft through **Arc&lt;Mutex&lt;Raft&gt;&gt;**. Other tasks communicate with the runtime through a bounded Tokio channel. Only one task owns and mutates protocol state, making ordering and invariants easier to reason about.
