@@ -177,6 +177,131 @@ Multi-node execution stops at the transport placeholders and is not claimed as c
 
 This design avoids sharing Raft through **Arc&lt;Mutex&lt;Raft&gt;&gt;**. Other tasks communicate with the runtime through a bounded Tokio channel. Only one task owns and mutates protocol state, making ordering and invariants easier to reason about.
 
+## Runtime driver and effect executor
+
+The runtime is the adapter between asynchronous callers and the deterministic Raft core. Its control flow has three layers:
+
+1. **handle_message** accepts a **RuntimeMessage**, stores any runtime-only data, and converts the message into the first Raft **Event**.
+2. **drive** alternates between the Raft core and the executor until there is no immediate work left.
+3. **execute** performs one **Effect** and may return another **Event** describing the completed work.
+
+The driver is conceptually:
+
+~~~rust
+async fn drive(&mut self, mut event: Event) -> Result<()> {
+    loop {
+        let Some(effect) = self.raft.handle(event)? else {
+            return Ok(());
+        };
+
+        let Some(next_event) = self.execute(effect).await? else {
+            return Ok(());
+        };
+
+        event = next_event;
+    }
+}
+~~~
+
+This creates the following loop:
+
+~~~text
+RuntimeMessage
+      |
+      | handle_message
+      v
+    Event -------------------------------+
+      |                                  |
+      | Raft::handle                     |
+      v                                  |
+    Effect                               |
+      |                                  |
+      | Runtime::execute                 |
+      v                                  |
+Some(next Event) ------------------------+
+
+None  -> the current chain is finished
+Err   -> stop the chain and fail the pending operation
+~~~
+
+### Responsibilities of each layer
+
+**handle_message** deals with data that does not belong in the Raft state machine. For a client write, it allocates an **OperationId**, stores the command buffer and one-shot reply sender in the operation table, and creates **Event::Write(operation_id)**. The core sees only the identifier, not the channel or reusable buffer.
+
+**Raft::handle** makes protocol decisions. It mutates only Raft state and returns **Option&lt;Effect&gt;**:
+
+- **Some(effect)** means the runtime must perform external work.
+- **None** means Raft has no immediate work to request.
+- **Err(error)** means the transition failed.
+
+**Runtime::execute** interprets effects. Depending on the effect, it may append to the log, persist hard state, read committed entries, call the FSM, send a response, reset a timer, or invoke the transport. When that work completes immediately, it returns **Some(event)** so the result goes back through **Raft::handle**. Returning **None** ends the current drive cycle.
+
+### Complete single-node write and response path
+
+The currently tested path runs through the driver as follows:
+
+~~~text
+RuntimeMessage::Write { data, reply }
+      |
+      | allocate OperationId and retain data/reply
+      v
+Event::Write(operation_id)
+      |
+      | Raft::handle
+      v
+Effect::AppendLocal
+      |
+      | execute: encode and append LogEntry
+      v
+Event::LocalEntriesAppended
+      |
+      | Raft::handle: update the leader's log position;
+      | a single voter is already a majority
+      v
+Effect::ApplyCommitted
+      |
+      | execute: read log entries and call FSM::apply
+      v
+Event::EntriesApplied
+      |
+      | Raft::handle: advance last_applied
+      v
+Effect::CompleteOperation
+      |
+      | execute: remove the pending operation and send Ok(())
+      v
+client one-shot receiver completes
+      |
+      v
+None: drive cycle ends
+~~~
+
+If **Raft::handle** or **execute** returns an error, **drive** stops immediately. **handle_message** then removes the pending operation and sends that error through its one-shot reply channel. This gives each client operation exactly one terminal success or failure response while the runtime remains alive to process later messages.
+
+### Asynchronous continuations
+
+Not every effect should keep the loop waiting. A network send or timer action may start asynchronous work and return **None**, ending the current drive cycle. When that work later completes, its task should send a new **RuntimeMessage** into the bounded channel. The runtime converts it to the corresponding response **Event** and starts another drive cycle:
+
+~~~text
+Effect::SendAppendEntries
+      |
+      | execute starts transport work
+      v
+None: current drive cycle ends
+
+...response arrives later...
+
+RuntimeMessage::AppendEntriesResponse   (planned)
+      |
+      v
+Event::AppendEntriesResponse
+      |
+      v
+new drive cycle
+~~~
+
+The current prototype implements this loop for **RuntimeMessage::Write** and its local persistence/FSM response chain. Timer messages and incoming or completed Raft RPC messages are not yet represented by **RuntimeMessage** variants, and their executor arms remain unfinished.
+
 ## Events and effects
 
 An **Event** describes something that has already happened:
