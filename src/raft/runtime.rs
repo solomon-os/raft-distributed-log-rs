@@ -83,7 +83,7 @@ impl<F: FSM> Runtime<F> {
     }
 
     async fn handle_message(&mut self, message: RuntimeMessage) {
-        match message {
+        let (event, operation_id) = match message {
             RuntimeMessage::Write { data, reply } => {
                 let operation_id = self.next_operation_id();
                 let replaced = self.operations.insert(
@@ -95,26 +95,27 @@ impl<F: FSM> Runtime<F> {
                 );
                 debug_assert!(replaced.is_none());
 
-                let result = match self.raft.handle(Event::Write(operation_id)) {
-                    Ok(effect) => self.drive(effect).await,
-                    Err(err) => Err(err),
-                };
-
-                if let Err(err) = result {
-                    self.fail_operation(operation_id, err);
-                }
+                (Event::Write(operation_id), operation_id)
             }
+        };
+
+        if let Err(err) = self.drive(event).await {
+            self.fail_operation(operation_id, err);
         }
     }
 
-    async fn drive(&mut self, mut effect: Option<Effect>) -> RaftResult<()> {
-        while let Some(next_effect) = effect {
-            let Some(event) = self.execute(next_effect).await? else {
-                break;
+    async fn drive(&mut self, mut event: Event) -> RaftResult<()> {
+        loop {
+            let Some(effect) = self.raft.handle(event)? else {
+                return Ok(());
             };
-            effect = self.raft.handle(event)?;
+
+            let Some(next_event) = self.execute(effect).await? else {
+                return Ok(());
+            };
+
+            event = next_event;
         }
-        Ok(())
     }
 
     async fn run(mut self, shutdown: CancellationToken, mut rx: Receiver<RuntimeMessage>) {
